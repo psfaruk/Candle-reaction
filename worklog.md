@@ -57,3 +57,26 @@ Stage Summary:
 - Backtest re-verified today: 58% WR overall, threshold-monotonic calibration intact
 - User to-do: revoke GitHub token (as planned) + rotate QX token (was shared in chat)
 - Railway: DEPLOY.md + Dockerfile ready; deploy by pointing Railway at the GitHub repo
+
+---
+Task ID: 4
+Agent: main (Super Z)
+Task: Fix Railway blank-screen deploy — make deployment fully automatic / zero-config (user report: app shows nothing after deploy, suspected port issue)
+
+Work Log:
+- Diagnosed root causes in deploy chain: (1) engine crashed on fresh DB if `bunx prisma db push` failed (dash `set -e` killed container → crash loop → blank), (2) `sh`+`wait -n` entrypoint fragility, (3) Next standalone under bun risk, (4) no health endpoint
+- Reproduced the exact crash locally: fresh DB → engine FATAL "table main.Setting does not exist" — confirmed failure mode
+- FIX engine/src/db.ts: self-bootstrapping schema (CREATE TABLE IF NOT EXISTS DDL mirroring prisma/schema.prisma, incl. indexes) — engine can never crash on empty DB
+- FIX engine/index.ts: /qx-health liveness endpoint (200 JSON: ok/mode/pairs/uptime), explicit 0.0.0.0 bind
+- FIX Dockerfile: node:22-slim build + node binary copied into oven/bun runtime (node runs Next standalone + prisma CLI, bun runs TS engine); engine deps installed with frozen lock; layer caching
+- FIX deploy/start.sh: bash supervisor — DB path auto (/data volume → /app/db fallback), prisma db push via node ×3 retries, next(:3001) + engine($PORT) launch, node-based readiness probe (no curl in slim), auto-restart dead children every 5s, SIGTERM clean shutdown
+- NEW railway.json: DOCKERFILE builder + /qx-health healthcheck + ON_FAILURE restart policy
+- Engine self-contained: http-proxy added as real engine dependency (bun add, lock updated)
+- Local prod-simulation verified: fresh DB WITHOUT prisma db push → engine booted, self-created tables, 23,040 candles; /qx-health 200; proxy → Next 200 (33KB HTML); socket.io handshake OK
+- Frozen lockfiles pass (root + engine), lint clean, browser live-data intact after engine hot-reload
+- Committed 8bbd1b3 + pushed to GitHub (secret scan clean), railway.json confirmed on GitHub (200)
+
+Stage Summary:
+- Deploy is now zero-config & self-healing: Railway only needs repo → generate domain
+- User verification URL after redeploy: https://<domain>/qx-health → {"ok":true,...}
+- Remaining user action: Railway Redeploy (or reconnect repo); volume at /data optional for persistence
