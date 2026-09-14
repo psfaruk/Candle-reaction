@@ -37,6 +37,7 @@ RUN npx next build \
 
 # ---- runtime stage: bun runs the TS engine, node runs the Next server ----
 FROM oven/bun:1
+RUN apt-get update && apt-get install -y --no-install-recommends bash && rm -rf /var/lib/apt/lists/*
 # node binary for battle-tested Next.js standalone + Prisma CLI execution
 COPY --from=node:22-slim /usr/local/bin/node /usr/local/bin/node
 
