@@ -36,3 +36,24 @@ Stage Summary:
 - Live signal pipeline verified in browser (win/loss resolution each minute)
 - Screenshots: download/qx-home.png, qx-signals.png, qx-settings.png, qx-mobile.png
 - Known limitation: sandbox Cloudflare blocks live Quotex feed; on Railway live connection may also be IP-blocked (documented in DEPLOY.md with VPS alternative)
+
+---
+Task ID: 3
+Agent: main (Super Z)
+Task: Final verification + GitHub push to psfaruk/Candle-reaction (user request: backtest verify → commit → push)
+
+Work Log:
+- Re-loaded fullstack-dev skill, verified dev server (:3000) + qx-engine (:3003) alive
+- Security audit: found real QX token as UI placeholder in settings-tab.tsx + .env tracked in git
+- Sanitized: generic placeholder, untracked .env/.zscripts/download, hardened .gitignore (node_modules, mini-services/*/node_modules, .zscripts)
+- Fresh backtest verification via engine RPC: 16,000 candles / 8 pairs → 1,886 signals @ 0.65 confidence → 58% WR (per pair 54–63%, CALL/PUT split, streaks)
+- Browser verification: 3 tabs render, settings token flow intact, sanitized placeholder confirmed, zero console/page errors
+- Wrote README.md (bilingual, architecture + 4-factor philosophy + backtest) and docs/BACKTEST.md (fresh verified numbers)
+- History rewrite (orphan branch): token existed in old commit 776aaeb; remote repo was empty → rebuilt clean 2-commit history, scanned full log for secrets = CLEAN
+- Pushed to https://github.com/psfaruk/Candle-reaction.git (main), verified via API, scrubbed GitHub token from local git remote URL
+
+Stage Summary:
+- Repo live: https://github.com/psfaruk/Candle-reaction (2 commits: feat + docs, secret-free history)
+- Backtest re-verified today: 58% WR overall, threshold-monotonic calibration intact
+- User to-do: revoke GitHub token (as planned) + rotate QX token (was shared in chat)
+- Railway: DEPLOY.md + Dockerfile ready; deploy by pointing Railway at the GitHub repo
