@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'http';
 import { Server } from 'socket.io';
 import httpProxy from 'http-proxy';
 import { MarketEngine } from './src/engine/market-engine';
-import { ensureSettings } from './src/db';
+import { ensureSchema, ensureSettings } from './src/db';
 import { ALL_PAIRS } from './src/pairs';
 
 // ============ QX Engine — socket.io service ============
@@ -16,6 +16,8 @@ const PORT = Number(process.env.QX_ENGINE_PORT || process.env.PORT || 3003);
 const NEXT_PORT = Number(process.env.QX_NEXT_PORT || 3000);
 
 async function main() {
+  // self-bootstrap: create tables if missing (fresh DB / new volume), then settings row
+  await ensureSchema();
   await ensureSettings();
 
   const httpServer = createServer();
@@ -27,6 +29,8 @@ async function main() {
     maxHttpBufferSize: 5e6,
   });
 
+  const engine = new MarketEngine();
+
   // proxy everything that is not /engine to the Next.js server
   const proxy = httpProxy.createProxyServer({ target: `http://127.0.0.1:${NEXT_PORT}`, ws: false });
   proxy.on('error', (_err: Error, _req: IncomingMessage, res: ServerResponse) => {
@@ -34,11 +38,23 @@ async function main() {
     res.end('next-server unreachable');
   });
   httpServer.on('request', (req, res) => {
-    if (req.url && (req.url.startsWith('/engine') || req.url.startsWith('/engine/'))) return; // socket.io handles it
+    const url = req.url ?? '/';
+    // liveness/readiness probe for Railway & orchestrators
+    if (url === '/qx-health' || url.startsWith('/qx-health')) {
+      const body = JSON.stringify({
+        ok: true,
+        service: 'qx-engine',
+        mode: engine.statusSnapshot().mode,
+        pairs: ALL_PAIRS.length,
+        uptimeSec: Math.round(process.uptime()),
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+      res.end(body);
+      return;
+    }
+    if (url.startsWith('/engine')) return; // socket.io handles it
     proxy.web(req, res);
   });
-
-  const engine = new MarketEngine();
 
   io.on('connection', (socket) => {
     // initial handshake payload
@@ -122,8 +138,8 @@ async function main() {
 
   await engine.start(io);
 
-  httpServer.listen(PORT, () => {
-    console.log(`[qx-engine] ✅ listening on :${PORT} (socket.io path /engine, next proxy → :${NEXT_PORT}, pairs: ${ALL_PAIRS.length})`);
+  httpServer.listen(PORT, '0.0.0.0', () => {
+    console.log(`[qx-engine] ✅ listening on 0.0.0.0:${PORT} (socket.io path /engine, health /qx-health, next proxy → :${NEXT_PORT}, pairs: ${ALL_PAIRS.length})`);
   });
 
   const shutdown = () => {

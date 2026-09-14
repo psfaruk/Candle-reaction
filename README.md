@@ -94,14 +94,20 @@ bun run dev          # Next.js on :3000
 
 Open the app → **সেটিংস** tab → paste your QX token (`q9securid` cookie value) → **সংযোগ করুন**.
 
-## 🚂 Deploy to Railway
+## 🚂 Deploy to Railway — ZERO-CONFIG
 
-Full Bengali guide in [`DEPLOY.md`](DEPLOY.md) — summary:
+Full Bengali guide in [`DEPLOY.md`](DEPLOY.md). Just:
 
-1. Push this repo to GitHub
-2. railway.app → New Project → Deploy from GitHub repo (Dockerfile auto-detected)
-3. Add Volume at `/data` (SQLite persistence)
-4. Open the app → Settings → paste QX token
+1. railway.app → **New Project** → **Deploy from GitHub repo** → this repo
+2. Settings → Networking → **Generate Domain** — done, the app runs
+
+**Everything is automatic** (no env vars, no manual setup):
+- Railway's `PORT` is bound automatically by the engine (`0.0.0.0`)
+- `railway.json` auto-configures the Dockerfile builder + `/qx-health` healthcheck
+- SQLite auto-locates to `/data` (volume) or `/app/db` (fallback) — attach a volume at `/data` only if you want persistence across redeploys
+- The engine **self-bootstraps its schema** on a fresh DB (`CREATE TABLE IF NOT EXISTS` at boot) — it cannot crash on an empty database
+- A supervisor auto-restarts any process that dies; Next.js standalone runs under Node (most reliable), the TS engine under Bun
+- Verify deployment: open `https://<your-domain>/qx-health` → `{"ok":true,...}`
 
 > ⚠️ **Note**: Quotex/Cloudflare blocks some datacenter IPs. If the LIVE feed can't connect from Railway, the app transparently falls back to SIM mode (labeled in UI). A small VPS near your region usually connects fine — see `DEPLOY.md`.
 
