@@ -80,3 +80,24 @@ Stage Summary:
 - Deploy is now zero-config & self-healing: Railway only needs repo → generate domain
 - User verification URL after redeploy: https://<domain>/qx-health → {"ok":true,...}
 - Remaining user action: Railway Redeploy (or reconnect repo); volume at /data optional for persistence
+
+---
+Task ID: 5
+Agent: main (Super Z)
+Task: Fix "token can't paste / buttons dead" on deployed app + auto-setup via variables (user request: ভ্যারিয়েবল লাগবে কী অটো যেনো সেটআপ হয়)
+
+Work Log:
+- Reproduced Railway's EXACT production stack locally (standalone Next via node + engine via bun + http-proxy on one port, default distDir classic flow)
+- Key finding 1: JS chunks + socket.io + token paste + buttons ALL work perfectly when the engine actually runs → code was correct; dead buttons = engine not running
+- Key finding 2: remote repo had Railway's own auto-PR merged ("Fix: Install bash in runtime image for start.sh") — oven/bun:1 lacked bash, CMD ['bash', deploy/start.sh] crashed the container; ALSO if service was built with Nixpacks (not Dockerfile), only Next.js runs → socket /engine 404 → connect button permanently disabled → "can't paste token, buttons dead"
+- Fix A (builder-proof): package.json start → bash deploy/start.sh (full supervisor boots under ANY builder); nixpacks.toml added with same cmd; build script = prisma generate + standalone copies; start.sh runtime fallback (node→bun), engine deps resolve from root node_modules
+- Fix B (QX_TOKEN auto-setup — user's ask): engine reads QX_TOKEN env at boot, wins over DB token, auto-connects Quotex live on every restart; getSettings exposes tokenSource; Settings tab shows blue env badge + reconnect button + warning when engine socket down
+- Fix C (boot speed): engine listens FIRST (~1s to /qx-health), history-gen + live-connect afterwards
+- Fix D (robustness): db.ts auto-creates SQLite parent dir; socket.io client polling-first transports
+- Verified locally: fresh-DB boot, instant health at t+1s, chunks 200 via proxy, socket handshake, token paste + connect flow, QX_TOKEN auto-connect attempt with graceful SIM fallback, env badge in UI, sandbox app healthy through gateway :81, lint clean
+- Merged Railway's bash-install PR (d51fe43) with my fixes, secret-scan clean, pushed f4734e3 → GitHub main verified
+
+Stage Summary:
+- Answer to user: NO variables required to run; only OPTIONAL QX_TOKEN for auto-live
+- Deploy now works under any builder; after redeploy verify /qx-health → {"ok":true}
+- User actions: Railway Redeploy (or delete+reconnect service), then optionally set QX_TOKEN variable
