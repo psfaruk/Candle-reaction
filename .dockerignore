@@ -1,0 +1,15 @@
+node_modules
+.next
+.git
+db
+download
+upload
+scripts
+tests
+examples
+skills
+dev.log
+server.log
+qx-engine.log
+*.db
+.DS_Store

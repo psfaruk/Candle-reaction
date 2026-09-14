@@ -1,0 +1,62 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Global engine settings (single row, id = "main")
+model Setting {
+  id            String   @id @default("main")
+  qxToken       String?
+  mode          String   @default("auto") // auto | live | simulation
+  minConfidence Int      @default(70)
+  pairs         String   @default("EURUSD,USDJPY,AUDUSD,GBPUSD,EURJPY,GBPJPY,USDCAD,USDCHF")
+  lastBacktest  String? // JSON summary of last backtest run
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+// 1-minute candles built from ticks
+model Candle {
+  id        String   @id // "PAIR:timestamp-ms"
+  pair      String
+  ts        DateTime // candle open time
+  open      Float
+  high      Float
+  low       Float
+  close     Float
+  ticks     Int      @default(0)
+  upTicks   Int      @default(0)
+  downTicks Int      @default(0)
+  lateFlip     Int      @default(0) // 1 = flipped to green in last 10s, -1 = to red, 0 = none
+  lateMomentum Float    @default(0) // pips moved in final 10s (signed)
+  flipCount    Int      @default(0) // total color changes inside the candle
+  source       String   @default("SIM") // LIVE | SIM
+  createdAt DateTime @default(now())
+
+  @@index([pair, ts])
+}
+
+// Signals generated at candle close; result = next 1m candle direction
+model Signal {
+  id         String    @id @default(cuid())
+  pair       String
+  ts         DateTime // signal time == trade entry (candle close moment)
+  direction  String // CALL | PUT
+  confidence Int // 0-100
+  score      Int
+  reasons    String // JSON array of {name, detail, points}
+  entryPrice Float
+  closePrice Float?
+  result     String    @default("PENDING") // PENDING | WIN | LOSS | TIE
+  source     String    @default("SIM") // LIVE | SIM | BACKTEST
+  backtestId String?
+  createdAt  DateTime  @default(now())
+
+  @@index([pair, ts])
+  @@index([source, ts])
+  @@index([result, ts])
+}

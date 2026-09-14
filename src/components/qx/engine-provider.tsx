@@ -1,0 +1,121 @@
+'use client';
+
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
+import { io, type Socket } from 'socket.io-client';
+import type {
+  EngineStatus, LogLine, MarketSnapshot, SignalRec, Candle,
+} from '../../../mini-services/qx-engine/src/types';
+
+export interface EngineSettingsView {
+  tokenMasked: string;
+  mode: string;
+  minConfidence: number;
+  pairs: string[];
+  allPairs: { symbol: string; name: string }[];
+}
+
+interface EngineCtx {
+  connected: boolean;
+  status: EngineStatus | null;
+  market: MarketSnapshot | null;
+  logs: LogLine[];
+  settings: EngineSettingsView | null;
+  rpc: <T>(event: string, payload?: unknown) => Promise<T>;
+  // last event ticks so tabs can refetch
+  signalTick: number;
+  candleTick: { pair: string; tick: number } | null;
+  reconnect: () => void;
+}
+
+const Ctx = createContext<EngineCtx | null>(null);
+
+export function useEngine(): EngineCtx {
+  const c = useContext(Ctx);
+  if (!c) throw new Error('useEngine must be used inside EngineProvider');
+  return c;
+}
+
+export function EngineProvider({ children }: { children: ReactNode }) {
+  const [connected, setConnected] = useState(false);
+  const [status, setStatus] = useState<EngineStatus | null>(null);
+  const [market, setMarket] = useState<MarketSnapshot | null>(null);
+  const [logs, setLogs] = useState<LogLine[]>([]);
+  const [settings, setSettings] = useState<EngineSettingsView | null>(null);
+  const [signalTick, setSignalTick] = useState(0);
+  const [candleTick, setCandleTick] = useState<{ pair: string; tick: number } | null>(null);
+  const socketRef = useRef<Socket | null>(null);
+  const [nonce, setNonce] = useState(0);
+
+  useEffect(() => {
+    // IMPORTANT: gateway path — always '/engine'; XTransformPort query routes
+    // to the engine service through the sandbox Caddy gateway. In production
+    // the engine IS the public server, so the same path works unchanged.
+    const socket = io({
+      path: '/engine',
+      query: { XTransformPort: 3003 },
+      transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1500,
+      timeout: 12000,
+    });
+    socketRef.current = socket;
+
+    socket.on('connect', () => setConnected(true));
+    socket.on('disconnect', () => setConnected(false));
+    socket.on('connect_error', () => setConnected(false));
+
+    socket.on('hello', (d: { status: EngineStatus; settings: EngineSettingsView; logs: LogLine[] }) => {
+      setStatus(d.status);
+      setSettings(d.settings);
+      setLogs(d.logs ?? []);
+    });
+    socket.on('market', (m: MarketSnapshot) => {
+      setMarket(m);
+      setStatus(m.status);
+    });
+    socket.on('status', (s: EngineStatus) => setStatus(s));
+    socket.on('log', (l: LogLine) => setLogs((prev) => [...prev.slice(-149), l]));
+    socket.on('signal:new', (_s: SignalRec) => setSignalTick((t) => t + 1));
+    socket.on('signal:resolved', (_s: SignalRec) => setSignalTick((t) => t + 1));
+    socket.on('candle:closed', (d: { pair: string; candle: Candle }) =>
+      setCandleTick({ pair: d.pair, tick: Date.now() }),
+    );
+
+    return () => {
+      socket.disconnect();
+    };
+  }, [nonce]);
+
+  const rpc = useCallback(<T,>(event: string, payload?: unknown): Promise<T> => {
+    return new Promise<T>((resolve, reject) => {
+      const s = socketRef.current;
+      if (!s || !s.connected) {
+        reject(new Error('ইঞ্জিনে সংযুক্ত নয়'));
+        return;
+      }
+      const timer = setTimeout(() => reject(new Error('রিকোয়েস্ট টাইমআউট')), 15000);
+      s.emit(event, payload ?? {}, (r: T) => {
+        clearTimeout(timer);
+        resolve(r);
+      });
+    });
+  }, []);
+
+  const reconnect = useCallback(() => setNonce((n) => n + 1), []);
+
+  // refresh settings periodically (token connect / save happen in other tabs)
+  useEffect(() => {
+    if (!connected) return;
+    const iv = setInterval(() => {
+      rpc<EngineSettingsView>('get-settings').then(setSettings).catch(() => {});
+    }, 5000);
+    return () => clearInterval(iv);
+  }, [connected, rpc]);
+
+  const value: EngineCtx = {
+    connected, status, market, logs, settings, rpc, signalTick, candleTick, reconnect,
+  };
+
+  return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
+}
