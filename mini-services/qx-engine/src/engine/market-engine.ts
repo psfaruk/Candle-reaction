@@ -27,6 +27,7 @@ export class MarketEngine {
   private activePairs: string[] = [];
   private minConfidence = 70;
   private qxToken: string | null = null;
+  private tokenSource: 'env' | 'db' = 'db';
 
   private lastMinute = 0;
   private pending = new Map<string, SignalRec>(); // pair -> awaiting resolution
@@ -52,10 +53,13 @@ export class MarketEngine {
     const s = await db.setting.findUnique({ where: { id: 'main' } });
     this.minConfidence = s?.minConfidence ?? 70;
     this.desiredMode = (s?.mode as any) ?? 'auto';
-    const token = s?.qxToken ?? null;
+    // QX_TOKEN env var wins (Railway Variables → fully automatic live setup)
+    const envToken = (process.env.QX_TOKEN || '').trim();
+    this.tokenSource = envToken ? 'env' : 'db';
+    const token = envToken || s?.qxToken || null;
     this.activePairs = (s?.pairs ?? ALL_PAIRS.map((p) => p.symbol)).split(',').filter(Boolean);
 
-    this.log('info', `ইঞ্জিন চালু — ${this.activePairs.length}টি পেয়ার, মোড: ${this.desiredMode}`);
+    this.log('info', `ইঞ্জিন চালু — ${this.activePairs.length}টি পেয়ার, মোড: ${this.desiredMode}${envToken ? ', টোকেন: QX_TOKEN env থেকে (অটো)' : ''}`);
 
     // load / generate history for each pair
     for (const sym of this.activePairs) {
@@ -66,7 +70,7 @@ export class MarketEngine {
     if (token && this.desiredMode !== 'simulation') {
       await this.startLive(token);
     } else {
-      this.log('info', token ? 'মোড simulation — লাইভ সংযোগ বন্ধ রাখা হয়েছে' : 'QX টোকেন নেই — সিমুলেশন ফিড চালু (Settings ট্যাব থেকে টোকেন দিন)');
+      this.log('info', token ? 'মোড simulation — লাইভ সংযোগ বন্ধ রাখা হয়েছে' : 'QX টোকেন নেই — সিমুলেশন ফিড চালু (Settings ট্যাব বা QX_TOKEN env ভ্যারিয়েবল থেকে টোকেন দিন)');
     }
 
     this.lastMinute = Math.floor(Date.now() / MINUTE);
@@ -157,6 +161,7 @@ export class MarketEngine {
   async startLive(token: string): Promise<{ ok: boolean; msg: string }> {
     this.stopLive();
     this.qxToken = token;
+    this.tokenSource = token === (process.env.QX_TOKEN || '').trim() ? 'env' : 'db';
     await db.setting.update({ where: { id: 'main' }, data: { qxToken: token } });
     return new Promise((resolve) => {
       let settled = false;
@@ -548,6 +553,7 @@ export class MarketEngine {
   getSettings() {
     return {
       tokenMasked: this.getTokenMasked(),
+      tokenSource: this.tokenSource,
       mode: this.desiredMode,
       minConfidence: this.minConfidence,
       pairs: [...this.activePairs],

@@ -1,6 +1,17 @@
+import { mkdirSync } from 'fs';
+import { dirname } from 'path';
 import { PrismaClient } from '@prisma/client';
 
 const DB_URL = process.env.DATABASE_URL || 'file:/home/z/my-project/db/custom.db';
+
+// self-healing: ensure the SQLite parent directory exists (fresh volume /
+// misconfigured DATABASE_URL must never crash the engine at boot)
+try {
+  if (DB_URL.startsWith('file:')) {
+    const p = DB_URL.slice(5).split('?')[0];
+    if (p && !p.startsWith(':memory:')) mkdirSync(dirname(p), { recursive: true });
+  }
+} catch { /* best-effort */ }
 
 export const db = new PrismaClient({
   datasources: { db: { url: DB_URL } },

@@ -64,14 +64,20 @@ if [ "$SCHEMA_OK" -ne 1 ]; then
 fi
 
 # ---------- 3) Next.js standalone (internal) ----------
+# prefer node (most battle-tested); fall back to bun on images without node
+NEXT_RUNTIME="node"
+command -v node >/dev/null 2>&1 || NEXT_RUNTIME="bun"
+
 start_next() {
-  PORT="$INTERNAL_PORT" HOSTNAME=0.0.0.0 node .next/standalone/server.js &
+  PORT="$INTERNAL_PORT" HOSTNAME=0.0.0.0 "$NEXT_RUNTIME" .next/standalone/server.js &
   NEXT_PID=$!
-  log "next.js standalone → :${INTERNAL_PORT} (pid $NEXT_PID)"
+  log "next.js standalone → :${INTERNAL_PORT} via ${NEXT_RUNTIME} (pid $NEXT_PID)"
 }
 
 # ---------- 4) qx-engine (public $PORT) ----------
 start_engine() {
+  # engine deps resolve from root node_modules when the engine's own
+  # node_modules is absent (e.g. Nixpacks installs root deps only)
   ( cd mini-services/qx-engine \
     && QX_ENGINE_PORT="$PORT" QX_NEXT_PORT="$INTERNAL_PORT" \
        DATABASE_URL="$DATABASE_URL" bun index.ts ) &
@@ -83,10 +89,10 @@ start_next
 start_engine
 
 # wait for next to answer (info only — engine proxies meanwhile)
-# NOTE: use node for the probe — curl is not present in slim images
+# NOTE: use $NEXT_RUNTIME for the probe — curl is not present in slim images
 (
   for i in $(seq 1 60); do
-    if node -e "require('http').get('http://127.0.0.1:${INTERNAL_PORT}/',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))" 2>/dev/null; then
+    if "$NEXT_RUNTIME" -e "require('http').get('http://127.0.0.1:${INTERNAL_PORT}/',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))" 2>/dev/null; then
       log "✅ next.js is answering on :${INTERNAL_PORT}"
       exit 0
     fi

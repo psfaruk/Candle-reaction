@@ -8,6 +8,7 @@ import type {
 
 export interface EngineSettingsView {
   tokenMasked: string;
+  tokenSource?: 'env' | 'db';
   mode: string;
   minConfidence: number;
   pairs: string[];
@@ -53,7 +54,9 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     const socket = io({
       path: '/engine',
       query: { XTransformPort: 3003 },
-      transports: ['websocket', 'polling'],
+      // polling first = maximally proxy-compatible (works even where WS
+      // upgrades are blocked); socket.io upgrades to websocket after
+      transports: ['polling', 'websocket'],
       reconnection: true,
       reconnectionAttempts: Infinity,
       reconnectionDelay: 1500,

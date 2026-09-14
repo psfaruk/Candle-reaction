@@ -1,0 +1,7 @@
+# Nixpacks fallback config — used ONLY if Railway builds this repo with the
+# Nixpacks builder instead of the Dockerfile (railway.json prefers Docker).
+# The start command is the same bash supervisor: it boots Next.js standalone
+# on an internal port AND the qx-engine (socket.io + proxy) on $PORT, so the
+# full app works identically no matter which builder Railway picks.
+[start]
+  cmd = "bash deploy/start.sh"

@@ -103,10 +103,11 @@ Full Bengali guide in [`DEPLOY.md`](DEPLOY.md). Just:
 
 **Everything is automatic** (no env vars, no manual setup):
 - Railway's `PORT` is bound automatically by the engine (`0.0.0.0`)
-- `railway.json` auto-configures the Dockerfile builder + `/qx-health` healthcheck
+- `railway.json` auto-configures the Dockerfile builder + `/qx-health` healthcheck; `package.json` start + `nixpacks.toml` make the same full-stack supervisor run under **any** builder (Nixpacks or Docker)
 - SQLite auto-locates to `/data` (volume) or `/app/db` (fallback) — attach a volume at `/data` only if you want persistence across redeploys
 - The engine **self-bootstraps its schema** on a fresh DB (`CREATE TABLE IF NOT EXISTS` at boot) — it cannot crash on an empty database
 - A supervisor auto-restarts any process that dies; Next.js standalone runs under Node (most reliable), the TS engine under Bun
+- **Auto-live (optional)**: set a `QX_TOKEN` variable in Railway → the engine connects to Quotex live automatically on every boot, no token paste needed (blue badge shows in Settings)
 - Verify deployment: open `https://<your-domain>/qx-health` → `{"ok":true,...}`
 
 > ⚠️ **Note**: Quotex/Cloudflare blocks some datacenter IPs. If the LIVE feed can't connect from Railway, the app transparently falls back to SIM mode (labeled in UI). A small VPS near your region usually connects fine — see `DEPLOY.md`.

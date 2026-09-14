@@ -136,11 +136,14 @@ async function main() {
     });
   });
 
-  await engine.start(io);
-
+  // listen FIRST so /qx-health + the UI are reachable immediately —
+  // history generation and the QX_TOKEN live-connect attempt happen in
+  // engine.start() afterwards (socket RPCs stay safe: engine is constructed)
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`[qx-engine] ✅ listening on 0.0.0.0:${PORT} (socket.io path /engine, health /qx-health, next proxy → :${NEXT_PORT}, pairs: ${ALL_PAIRS.length})`);
   });
+
+  await engine.start(io);
 
   const shutdown = () => {
     console.log('[qx-engine] shutting down...');

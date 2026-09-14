@@ -118,6 +118,11 @@ export function SettingsTab() {
                 <span className={`h-1.5 w-1.5 rounded-full ${status?.mode === 'LIVE' ? 'bg-emerald-400' : 'bg-amber-400'} animate-pulse`} />
                 {status?.mode === 'LIVE' ? 'লাইভ Quotex ডেটা চলছে' : 'সিমুলেশন মোড'}
               </span>
+              {settings?.tokenSource === 'env' && (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-sky-500/40 bg-sky-500/10 px-2.5 py-1 font-medium text-sky-400">
+                  ⚙ QX_TOKEN ভ্যারিয়েবল সক্রিয় — রিস্টার্টে অটো-কানেক্ট
+                </span>
+              )}
               {settings?.tokenMasked && <span className="text-zinc-500">বর্তমান টোকেন: <span className="font-mono">{settings.tokenMasked}</span></span>}
               {status?.accountBalance != null && (
                 <span className="text-zinc-400">ব্যালেন্স: <b className="text-emerald-400">{status.accountBalance} {status.currency ?? ''}</b></span>
@@ -142,10 +147,23 @@ export function SettingsTab() {
                 <Button onClick={disconnectLive} variant="outline" className="border-zinc-700 text-zinc-300">
                   লাইভ বন্ধ
                 </Button>
+                {!connected && (
+                  <Button onClick={reconnect} variant="outline" className="border-red-500/40 text-red-400">
+                    ইঞ্জিন পুনঃসংযোগ
+                  </Button>
+                )}
               </div>
+              {!connected && (
+                <p className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-[11px] leading-relaxed text-red-300">
+                  ⚠ ইঞ্জিনে সংযোগ হয়নি — তাই টোকেন/সেটিংস বাটন নিষ্ক্রিয়। ডিপ্লয়ের সময় <span className="font-mono">/qx-health</span> ঠিক আছে কিনা দেখুন (DEPLOY.md)।
+                  "ইঞ্জিন পুনঃসংযোগ" চাপুন অথবা পেজ রিফ্রেশ করুন।
+                </p>
+              )}
               <p className="text-[11px] leading-relaxed text-zinc-500">
                 কীভাবে পাবেন: qxbroker.com-এ লগইন করুন → ব্রাউজার DevTools → Application → Cookies → <span className="font-mono text-zinc-400">q9securid</span>-এর ভ্যালু কপি করে এখানে পেস্ট করুন।
                 টোকেন সার্ভারে সংরক্ষিত হয়, ব্রাউজারে ফুল টোকেন আর দেখা যায় না। সংযোগ সফল হলে হোমে &quot;লাইভ&quot; ব্যাজ দেখাবে এবং সিগন্যাল LIVE সোর্সে যাবে।
+                <br />
+                <span className="text-zinc-400">অটো-সেটআপ:</span> Railway Variables-এ <span className="font-mono text-zinc-400">QX_TOKEN</span> সেট করলে টোকেন পেস্ট করতেই হবে না — রিস্টার্টে নিজে লাইভ হবে।
               </p>
             </div>
           </CardContent>
