@@ -155,6 +155,10 @@ class PairCandleStore:
         self.running = RunningCandle(self.pair, ts, open_price)
 
     def append_closed(self, c: dict):
+        # রেস-সুরক্ষা: টিক-পাথ আর মিনিট-ওয়াচার একসাথে ক্লোজ করলেও
+        # একই টাইমস্ট্যাম্প দুইবার ঢুকবে না (ডুপ্লিকেট = চার্ট assertion ভাঙে)
+        if self.candles and self.candles[-1]["ts"] >= c["ts"]:
+            return
         self.candles.append(c)
         if len(self.candles) > self.max_keep:
             del self.candles[:len(self.candles) - self.max_keep]

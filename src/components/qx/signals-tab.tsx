@@ -7,6 +7,8 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Skeleton } from '@/components/ui/skeleton';
 import type { Candle, PairStat, SignalRec, StatsBlock } from '@/lib/qx-types';
 import { useEngine } from './engine-provider';
+import { useLiveQuote } from './tick-store';
+import { SmoothPrice, useSecondsLeft } from './live-bits';
 import { DirectionBadge, EmptyState, ResultBadge, SectionTitle, fmtTime } from './bits';
 import { RunningCandlePanel } from './running-candle-panel';
 
@@ -53,6 +55,12 @@ export function SignalsTab() {
       setHistory(r.candles);
     } catch { /* noop */ }
   }, [activePair, rpc]);
+
+  // পেয়ার বদলালেই পুরনো হিস্ট্রি মুছে দিই — চার্ট কখনো দুই পেয়ারের
+  // ডেটা মিশিয়ে দেখাবে না (এটাই আগে ভাঙার মূল কারণগুলোর একটি ছিল)
+  useEffect(() => {
+    setHistory([]);
+  }, [activePair]);
 
   useEffect(() => {
     if (!connected || !activePair) return;
@@ -104,8 +112,11 @@ export function SignalsTab() {
   }, [history, market, activePair]);
 
   const runState = market?.pairs.find((p) => p.pair === activePair)?.running ?? null;
+  const live = useLiveQuote(activePair);
+  const secondsLeft = useSecondsLeft(live?.ts ?? runState?.ts);
   const pairStat = stats?.perPair.find((s) => s.pair === activePair) ?? null;
   const summary = activePair ? pairStat : stats?.overall ?? null;
+  const liveColor = live && live.c > 0 ? (live.c > live.o ? 'GREEN' : live.c < live.o ? 'RED' : 'FLAT') : runState?.color ?? 'FLAT';
 
   const toggleExpand = (id: string) =>
     setExpanded((prev) => {
@@ -137,27 +148,28 @@ export function SignalsTab() {
           <Card className="border-zinc-800 bg-zinc-900/60">
             <CardContent className="p-4">
               <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                <div className="flex items-center gap-3">
+                <div className="flex items-baseline gap-3">
                   <h3 className="text-base font-semibold text-zinc-100">{activePair}</h3>
+                  <SmoothPrice pair={activePair} digits={digits} className="font-mono text-lg font-bold tabular-nums text-zinc-100" fallback="" />
                   {runState && (
                     <span
                       className={`rounded px-2 py-0.5 text-xs font-semibold ${
-                        runState.color === 'GREEN' ? 'bg-emerald-500/15 text-emerald-400' : runState.color === 'RED' ? 'bg-red-500/15 text-red-400' : 'bg-zinc-700/40 text-zinc-300'
+                        liveColor === 'GREEN' ? 'bg-emerald-500/15 text-emerald-400' : liveColor === 'RED' ? 'bg-red-500/15 text-red-400' : 'bg-zinc-700/40 text-zinc-300'
                       }`}
                     >
-                      {runState.color === 'GREEN' ? 'গ্রিন' : runState.color === 'RED' ? 'রেড' : 'ফ্ল্যাট'}
+                      {liveColor === 'GREEN' ? 'গ্রিন' : liveColor === 'RED' ? 'রেড' : 'ফ্ল্যাট'}
                     </span>
                   )}
                 </div>
                 {runState && (
                   <div className="flex items-center gap-2 text-xs text-zinc-400">
                     <span>ক্যান্ডেল ক্লোজ হতে আর</span>
-                    <span className="font-mono text-base font-bold tabular-nums text-amber-400">{runState.secondsLeft}s</span>
+                    <span className="font-mono text-base font-bold tabular-nums text-amber-400">{secondsLeft}s</span>
                   </div>
                 )}
               </div>
               {chartCandles.length > 0 ? (
-                <CandleChart candles={chartCandles} signals={pairSignals} digits={digits} />
+                <CandleChart pair={activePair} candles={chartCandles} signals={pairSignals} digits={digits} />
               ) : (
                 <EmptyState text="চার্ট লোড হচ্ছে..." />
               )}

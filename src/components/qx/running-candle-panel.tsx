@@ -4,12 +4,15 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
 import { Separator } from '@/components/ui/separator';
 import type { RunningCandleState } from '@/lib/qx-types';
+import { useLiveQuote } from './tick-store';
+import { SmoothPrice, useSecondsLeft } from './live-bits';
 import { EmptyState, fmtNum } from './bits';
 
 // ============ রানিং ক্যান্ডেল অ্যানালাইজার ============
 // মানুষ চোখে যা দেখে, ইঞ্জিন মিলিসেকেন্ডে টিক-ভিত্তিক দেখে:
 // টিক ইমব্যালেন্স, ৫s/১০s মোমেন্টাম, কালার-ফ্লিপ ইতিহাস,
 // উইক গঠন, জোন-দূরত্ব এবং "এখন ক্লোজ হলে" লাইভ স্কোর।
+// দাম/টিক-সংখ্যা সরাসরি ১০Hz টিক-স্ট্রিম থেকে — ইঞ্জিনের সাথে মিলিসেকেন্ডে।
 
 function ColorDot({ color }: { color: string }) {
   const c = color === 'GREEN' ? 'bg-emerald-500' : color === 'RED' ? 'bg-red-500' : 'bg-zinc-500';
@@ -17,10 +20,20 @@ function ColorDot({ color }: { color: string }) {
 }
 
 export function RunningCandlePanel({ run, digits }: { run: RunningCandleState | null; digits: number }) {
+  const live = useLiveQuote(run?.pair);
+  const secondsLeft = useSecondsLeft(live?.ts ?? run?.ts);
   if (!run) return <EmptyState text="ক্যান্ডেল ডেটা আসছে..." />;
 
-  const total = Math.max(run.upTicks + run.downTicks, 1);
-  const upPct = Math.round((run.upTicks / total) * 100);
+  // টিক-স্ট্রিম থেকে ফ্রেশ ভ্যালু (না পেলে ১s স্ন্যাপশটের ভ্যালু)
+  const ticks = live?.tk ?? run.ticks;
+  const upTicks = live?.up ?? run.upTicks;
+  const downTicks = live?.dn ?? run.downTicks;
+  const high = Math.max(run.high, live?.h ?? 0);
+  const low = run.low > 0 ? Math.min(run.low, live?.l ?? Number.MAX_VALUE) : (live?.l ?? run.low);
+  const color = live && live.c > 0 ? (live.c > live.o ? 'GREEN' : live.c < live.o ? 'RED' : run.color) : run.color;
+
+  const total = Math.max(upTicks + downTicks, 1);
+  const upPct = Math.round((upTicks / total) * 100);
   const score = run.liveScore;
   const scoreOk = score && score.score >= 55;
 
@@ -29,36 +42,39 @@ export function RunningCandlePanel({ run, digits }: { run: RunningCandleState | 
       <CardHeader className="pb-2">
         <CardTitle className="flex items-center justify-between text-sm">
           <span className="flex items-center gap-2">
-            <ColorDot color={run.color} />
+            <ColorDot color={color} />
             রানিং ক্যান্ডেলের ভিতরে এখন কী হচ্ছে
           </span>
-          <span className="tabular-nums text-amber-400">{run.secondsLeft}s বাকি</span>
+          <span className="tabular-nums text-amber-400">{secondsLeft}s বাকি</span>
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-3 text-sm">
         {/* countdown */}
-        <Progress className="h-1" value={((60 - run.secondsLeft) / 60) * 100} />
+        <Progress className="h-1" value={((60 - secondsLeft) / 60) * 100} />
 
-        {/* prices */}
+        {/* prices — লাস্ট ৬০fps স্মুথ, বাকিগুলো ১০Hz */}
         <div className="grid grid-cols-4 gap-1.5 text-center text-xs">
           {[
-            { l: 'ওপেন', v: fmtNum(run.open, digits) },
-            { l: 'হাই', v: fmtNum(run.high, digits) },
-            { l: 'লো', v: fmtNum(run.low, digits) },
-            { l: 'লাস্ট', v: fmtNum(run.last, digits) },
+            { l: 'ওপেন', v: fmtNum(live?.o ?? run.open, digits) },
+            { l: 'হাই', v: fmtNum(high, digits) },
+            { l: 'লো', v: fmtNum(low, digits) },
           ].map((x) => (
             <div key={x.l} className="rounded bg-zinc-800/60 px-1 py-1.5">
               <p className="text-[10px] text-zinc-500">{x.l}</p>
               <p className="font-mono font-medium tabular-nums text-zinc-200">{x.v}</p>
             </div>
           ))}
+          <div className="rounded bg-emerald-500/10 px-1 py-1.5">
+            <p className="text-[10px] text-emerald-500/80">লাইভ</p>
+            <SmoothPrice pair={run.pair} digits={digits} className="block font-mono font-semibold tabular-nums text-emerald-300" fallback="—" />
+          </div>
         </div>
 
         <div className="grid grid-cols-2 gap-2 text-xs">
           <div className="rounded bg-zinc-800/40 px-2 py-1.5">
             <span className="text-zinc-500">রঙ: </span>
-            <span className={run.color === 'GREEN' ? 'font-semibold text-emerald-400' : run.color === 'RED' ? 'font-semibold text-red-400' : 'text-zinc-300'}>
-              {run.color === 'GREEN' ? 'গ্রিন' : run.color === 'RED' ? 'রেড' : 'ফ্ল্যাট'}
+            <span className={color === 'GREEN' ? 'font-semibold text-emerald-400' : color === 'RED' ? 'font-semibold text-red-400' : 'text-zinc-300'}>
+              {color === 'GREEN' ? 'গ্রিন' : color === 'RED' ? 'রেড' : 'ফ্ল্যাট'}
             </span>
             <span className="ml-2 text-zinc-500">ফ্লিপ: {run.colorFlips}×</span>
           </div>
@@ -71,7 +87,7 @@ export function RunningCandlePanel({ run, digits }: { run: RunningCandleState | 
         {/* tick ratio */}
         <div>
           <div className="mb-1 flex justify-between text-xs">
-            <span className="text-zinc-500">টিক ডিরেকশন ({run.ticks} টিক)</span>
+            <span className="text-zinc-500">টিক ডিরেকশন ({ticks} টিক)</span>
             <span className="tabular-nums text-zinc-300">
               <span className="text-emerald-400">{upPct}% আপ</span> / <span className="text-red-400">{100 - upPct}% ডাউন</span>
             </span>

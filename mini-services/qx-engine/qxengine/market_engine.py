@@ -49,6 +49,7 @@ class MarketEngine:
         self._emit_fn = None
         self._tasks = []
         self.last_minute = 0
+        self._tick_dirty = set()     # pair-গুলো নতুন টিক পেয়েছে (১০Hz ফ্লাশ হবে)
         self.account = {"balance": None, "currency": None, "login": None}
         self.yahoo = YahooFeed(self._on_yahoo_bars, self.log)
 
@@ -92,6 +93,7 @@ class MarketEngine:
 
         self._tasks.append(asyncio.create_task(self._minute_watcher()))
         self._tasks.append(asyncio.create_task(self._broadcast_loop()))
+        self._tasks.append(asyncio.create_task(self._tick_broadcast_loop()))
         self._tasks.append(asyncio.create_task(self._yahoo_loop()))
 
         if token:
@@ -126,10 +128,20 @@ class MarketEngine:
         store = self.stores.get(sym)
         if store is None:
             store = self.stores[sym] = PairCandleStore(sym)
+        # মার্জ-ফিক্স: bootstrap দেরিতে শেষ হলে লাইভ-টিকে ইতিমধ্যে বন্ধ
+        # হয়ে যাওয়া ক্যান্ডেল রিপ্লেসমেন্টে হারাবে না (আগে হারাত — ১ মিনিট ফাঁক)
+        if store.candles:
+            have = {c["ts"] for c in candles}
+            extra = [c for c in store.candles if c["ts"] not in have]
+            if extra:
+                candles = candles + extra
+                candles.sort(key=lambda x: x["ts"])
+                candles = candles[-store.max_keep:]
         store.candles = candles
         self.feed_owner.setdefault(sym, "yahoo")
         if candles and not store.running:
             store.start_running(cur_minute, candles[-1]["close"])
+            self._tick_dirty.add(sym)   # বুটস্ট্র্যাপের রানিং ক্যান্ডেল সাথে সাথেই চার্টে
 
     async def _yahoo_loop(self):
         await asyncio.sleep(2)  # let bootstrap start filling
@@ -212,6 +224,7 @@ class MarketEngine:
             self.log("info", f"লাইভ Quotex টিক ডেটা সক্রিয় হলো ({pair})")
             self.emit("status", self.status_snapshot())
         self._on_tick(pair, price, t)
+        self._tick_dirty.add(pair)   # ফাস্ট-পাথ: ১০Hz-এ ব্রাউজারে যাবে
 
     def on_quotex_candles(self, pair: str, candles):
         store = self.stores.get(pair)
@@ -283,6 +296,7 @@ class MarketEngine:
                 color = "GREEN" if c > run.open else ("RED" if c < run.open else (run.sec_colors[sec] or "FLAT"))
                 run.sec_colors[sec] = color
                 run.last_tick_at = now_ms
+        self._tick_dirty.add(pair)   # ফাস্ট-পাথে ব্রাউজারে যাবে
 
     # ---------------- tick & minute pipeline ----------------
 
@@ -296,7 +310,19 @@ class MarketEngine:
                 return
             open_ref = (store.running.last if store.running
                         else (store.candles[-1]["close"] if store.candles else price))
-            store.start_running(minute, open_ref)
+            # রেস-ফিক্স: নতুন মিনিটের প্রথম টিক-ই আগের ক্যান্ডেল ক্লোজ করে।
+            # আগে শুধু মিনিট-ওয়াচার (২০০ms চক্র) ক্লোজ করত — কিন্তু টিক আগে
+            # এসে running বদলে দিলে পুরনো ক্যান্ডেল চুপচাপ হারিয়ে যেত (মিনিট
+            # ফাঁক, সিগন্যাল বাদ, চার্টে গ্যাপ)। এখন যে-পথ আগে পৌঁছায় সে-ই ক্লোজ করে।
+            if store.running and store.running.ts < minute:
+                candle = store.close_current(t, "LIVE")
+                if candle is not None:
+                    try:
+                        self._finalize_closed_candle(pair, candle, already_appended=True)
+                    except Exception as e:
+                        self.log("warn", f"[{pair}] টিক-পাথ ক্যান্ডেল ক্লোজ ত্রুটি: {e}")
+            if not store.running:
+                store.start_running(minute, open_ref)
         store.running.on_tick(t, price)
 
     async def _minute_watcher(self):
@@ -324,6 +350,7 @@ class MarketEngine:
                                   else get_pair_def(sym)["basePrice"])
                     if not store.running or store.running.ts != cur * MINUTE:
                         store.start_running(cur * MINUTE, last_close)
+                    self._tick_dirty.add(sym)   # নতুন মিনিটের ক্যান্ডেল সাথে সাথেই চার্টে
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -390,6 +417,40 @@ class MarketEngine:
                 self.emit("market", self.snapshot())
             except Exception as e:
                 self.log("warn", f"ব্রডকাস্ট ত্রুটি: {e}")
+
+    async def _tick_broadcast_loop(self):
+        """ফাস্ট-পাথ: নতুন টিক পাওয়া পেয়ারগুলোকে ১০Hz-এ ব্রাউজারে পাঠায়।
+
+        Quotex থেকে ৮-১২ টিক/সেকেন্ড আসে — প্রতি টিকে আলাদা socket ইভেন্ট
+        পাঠালে ৮ পেয়ারে সেকেন্ডে ~১০০ প্যাকেট হয়ে যায়; তাই ১০০ms-এর
+        ব্যাচে পাঠাই (সর্বোচ্চ ১০০ms বিলম্ব, ব্রাউজারে rAF-ইন্টারপোলেশন
+        ৬০fps মোশন বানায়)।"""
+        while True:
+            await asyncio.sleep(0.1)
+            try:
+                if not self._tick_dirty:
+                    continue
+                dirty = self._tick_dirty
+                self._tick_dirty = set()
+                now = int(time.time() * 1000)
+                quotes = []
+                for sym in dirty:
+                    store = self.stores.get(sym)
+                    run = store.running if store else None
+                    if run is None:
+                        continue
+                    quotes.append({
+                        "p": sym, "ts": run.ts,
+                        "o": run.open, "h": run.high, "l": run.low, "c": run.last,
+                        "tk": run.ticks, "up": run.up_ticks, "dn": run.down_ticks,
+                        "t": now,
+                    })
+                if quotes:
+                    self.emit("ticks", {"t": now, "q": quotes})
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.log("warn", f"টিক-ব্রডকাস্ট ত্রুটি: {e}")
 
     def _feed(self) -> str:
         if self._qx_fresh_any():

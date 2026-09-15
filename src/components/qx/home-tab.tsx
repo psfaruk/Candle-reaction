@@ -3,11 +3,50 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import type { PairStat, SignalRec, StatsBlock } from '@/lib/qx-types';
+import type { PairMarketState, PairStat, SignalRec, StatsBlock } from '@/lib/qx-types';
 import { useEngine } from './engine-provider';
+import { useLiveQuote } from './tick-store';
+import { SmoothPrice, useSecondsLeft } from './live-bits';
 import { DirectionBadge, EmptyState, ResultBadge, WinRateCard, fmtTime, SectionTitle } from './bits';
 
 interface StatsResp { overall: StatsBlock | null; perPair: PairStat[] }
+
+/** একটি পেয়ারের লাইভ কার্ড — দাম/রঙ/কাউন্টডাউন ১০Hz টিক-স্ট্রিম থেকে */
+function PairCard({ p }: { p: PairMarketState }) {
+  const live = useLiveQuote(p.pair);
+  const secondsLeft = useSecondsLeft(live?.ts ?? p.running.ts);
+  const up = p.changePips1m >= 0;
+  const price = live?.c ?? p.price;
+  const color = live && live.c > 0 ? (live.c > live.o ? 'GREEN' : live.c < live.o ? 'RED' : p.running.color) : p.running.color;
+  return (
+    <Card className="border-zinc-800 bg-zinc-900/60 transition-colors hover:border-zinc-700">
+      <CardContent className="p-3.5">
+        <div className="flex items-center justify-between">
+          <span className="text-sm font-semibold text-zinc-200">{p.name}</span>
+          <span
+            className={`inline-block h-2 w-2 rounded-full ${
+              color === 'GREEN' ? 'bg-emerald-500' : color === 'RED' ? 'bg-red-500' : 'bg-zinc-600'
+            } animate-pulse`}
+          />
+        </div>
+        <SmoothPrice pair={p.pair} digits={p.digits} className="mt-1 block font-mono text-lg font-bold tabular-nums text-zinc-100" fallback={price ? price.toFixed(p.digits) : '…'} />
+        <div className="mt-1.5 flex items-center justify-between text-[11px]">
+          <span className={up ? 'text-emerald-400' : 'text-red-400'}>
+            {up ? '▲' : '▼'} {Math.abs(p.changePips1m)} পিপ (আগের ক্যান্ডেল)
+          </span>
+          <span className="tabular-nums text-zinc-500">{secondsLeft}s</span>
+        </div>
+        {p.running.liveScore && p.running.liveScore.score >= 55 && (
+          <p className={`mt-2 truncate rounded px-1.5 py-0.5 text-[11px] font-medium ${
+            p.running.liveScore.direction === 'CALL' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-red-500/15 text-red-400'
+          }`}>
+            প্রিভিউ: {p.running.liveScore.direction === 'CALL' ? '▲ কল' : '▼ পুট'} {p.running.liveScore.score}%
+          </p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
 
 const PERIODS: { label: string; h: number }[] = [
   { label: 'উইন রেট — শেষ ১ ঘণ্টা', h: 1 },
@@ -68,39 +107,9 @@ export function HomeTab() {
         <SectionTitle>লাইভ মার্কেট (১ মিনিটের ক্যান্ডেল চলছে)</SectionTitle>
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
           {pairs.length === 0 && <EmptyState text="মার্কেট ডেটা আসছে..." />}
-          {pairs.map((p) => {
-            const up = p.changePips1m >= 0;
-            return (
-              <Card key={p.pair} className="border-zinc-800 bg-zinc-900/60 transition-colors hover:border-zinc-700">
-                <CardContent className="p-3.5">
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm font-semibold text-zinc-200">{p.name}</span>
-                    <span
-                      className={`inline-block h-2 w-2 rounded-full ${
-                        p.running.color === 'GREEN' ? 'bg-emerald-500' : p.running.color === 'RED' ? 'bg-red-500' : 'bg-zinc-600'
-                      } animate-pulse`}
-                    />
-                  </div>
-                  <p className="mt-1 font-mono text-lg font-bold tabular-nums text-zinc-100">
-                    {p.price.toFixed(p.digits)}
-                  </p>
-                  <div className="mt-1.5 flex items-center justify-between text-[11px]">
-                    <span className={up ? 'text-emerald-400' : 'text-red-400'}>
-                      {up ? '▲' : '▼'} {Math.abs(p.changePips1m)} পিপ (আগের ক্যান্ডেল)
-                    </span>
-                    <span className="tabular-nums text-zinc-500">{p.running.secondsLeft}s</span>
-                  </div>
-                  {p.running.liveScore && p.running.liveScore.score >= 55 && (
-                    <p className={`mt-2 truncate rounded px-1.5 py-0.5 text-[11px] font-medium ${
-                      p.running.liveScore.direction === 'CALL' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-red-500/15 text-red-400'
-                    }`}>
-                      প্রিভিউ: {p.running.liveScore.direction === 'CALL' ? '▲ কল' : '▼ পুট'} {p.running.liveScore.score}%
-                    </p>
-                  )}
-                </CardContent>
-              </Card>
-            );
-          })}
+          {pairs.map((p) => (
+            <PairCard key={p.pair} p={p} />
+          ))}
         </div>
       </section>
 

@@ -5,6 +5,10 @@ import { io, type Socket } from 'socket.io-client';
 import type {
   EngineStatus, LogLine, MarketSnapshot, SignalRec, Candle,
 } from '@/lib/qx-types';
+import { tickStore } from './tick-store';
+
+/** ইঞ্জিনের ১০Hz টিক-ব্যাচ ফরম্যাট */
+export type LiveQuoteBatch = Parameters<typeof tickStore.ingest>[0];
 
 export interface EngineSettingsView {
   tokenMasked: string;
@@ -54,12 +58,13 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     const socket = io({
       path: '/engine',
       query: { XTransformPort: 3003 },
-      // polling first = maximally proxy-compatible (works even where WS
-      // upgrades are blocked); socket.io upgrades to websocket after
-      transports: ['polling', 'websocket'],
+      // websocket first = সর্বনিম্ন লেটেন্সি (মিলিসেকেন্ড-স্তরের ডেটা)।
+      // polling শুধু ফলব্যাক — WS আপগ্রেড ব্লকড হলেও অ্যাপ চলবে।
+      transports: ['websocket', 'polling'],
       reconnection: true,
       reconnectionAttempts: Infinity,
-      reconnectionDelay: 1500,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
       timeout: 12000,
     });
     socketRef.current = socket;
@@ -76,8 +81,14 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     socket.on('market', (m: MarketSnapshot) => {
       setMarket(m);
       setStatus(m.status);
+      // মার্কেট স্ন্যাপশটের running থেকে টিক-স্টোর সিড (টিক না এলেও দাম দেখাবে)
+      tickStore.seedFromSnapshot(m.pairs);
     });
     socket.on('status', (s: EngineStatus) => setStatus(s));
+    // ফাস্ট-পাথ: ১০Hz টিক ব্যাচ → external store (React state স্কিপ)
+    socket.on('ticks', (d: { q?: LiveQuoteBatch }) => {
+      if (d && Array.isArray(d.q)) tickStore.ingest(d.q);
+    });
     socket.on('log', (l: LogLine) => setLogs((prev) => [...prev.slice(-149), l]));
     socket.on('signal:new', (_s: SignalRec) => setSignalTick((t) => t + 1));
     socket.on('signal:resolved', (_s: SignalRec) => setSignalTick((t) => t + 1));
