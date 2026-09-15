@@ -130,7 +130,7 @@ export function SettingsTab() {
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="qx-token" className="text-zinc-300">QX টোকেন (q9securid কুকি)</Label>
+              <Label htmlFor="qx-token" className="text-zinc-300">QX টোকেন (authorization লাইন বা q9securid কুকি)</Label>
               <div className="flex flex-col gap-2 sm:flex-row">
                 <Input
                   id="qx-token"
@@ -160,8 +160,13 @@ export function SettingsTab() {
                 </p>
               )}
               <p className="text-[11px] leading-relaxed text-zinc-500">
-                কীভাবে পাবেন: qxbroker.com-এ লগইন করুন → ব্রাউজার DevTools → Application → Cookies → <span className="font-mono text-zinc-400">q9securid</span>-এর ভ্যালু কপি করে এখানে পেস্ট করুন।
-                টোকেন সার্ভারে সংরক্ষিত হয়, ব্রাউজারে ফুল টোকেন আর দেখা যায় না। সংযোগ সফল হলে হোমে &quot;লাইভ&quot; ব্যাজ দেখাবে এবং সিগন্যাল LIVE সোর্সে যাবে।
+                <b className="text-zinc-400">টোকেন কীভাবে নিবেন (২ উপায় — ① সবচেয়ে নির্ভরযোগ্য):</b>
+                <br />
+                <span className="text-zinc-400">①</span> qxbroker.com-এ লগইন করুন → <b className="text-zinc-400">F12</b> → <b className="text-zinc-400">Network</b> ট্যাব → <b className="text-zinc-400">WS</b> লিখে ফিল্টার করুন → socket.io/ws2 কানেকশনে ক্লিক করুন → <b className="text-zinc-400">Messages</b> ট্যাব → আপনার ব্রাউজারের পাঠানো সবুজ রঙের <span className="font-mono text-zinc-400">42[&quot;authorization&quot;,&#123;&quot;session&quot;:&quot;…&quot;&#125;]</span> লাইনটি <b className="text-zinc-400">পুরোপুরি কপি</b> করে এখানে পেস্ট করুন।
+                <br />
+                <span className="text-zinc-400">②</span> DevTools → <b className="text-zinc-400">Application</b> → Cookies → <span className="font-mono text-zinc-400">q9securid</span>-এর ভ্যালু কপি করুন।
+                <br />
+                <span className="text-amber-500/80">⚠</span> পুরো authorization লাইন পেস্ট করলেও হবে — অ্যাপ নিজে টোকেনটি বের করে নেয়। টোকেন কয়েক ঘণ্টা/দিন পর <b className="text-zinc-400">মেয়াদ শেষ হয়ে যায়</b> — তখন "প্রত্যাখ্যাত" দেখালে নতুন করে কপি করতে হবে। টোকেন সার্ভারে সংরক্ষিত হয়, ব্রাউজারে ফুল টোকেন আর দেখা যায় না।
                 <br />
                 <span className="text-zinc-400">অটো-সেটআপ:</span> Railway Variables-এ <span className="font-mono text-zinc-400">QX_TOKEN</span> সেট করলে টোকেন পেস্ট করতেই হবে না — রিস্টার্টে নিজে লাইভ হবে।
               </p>

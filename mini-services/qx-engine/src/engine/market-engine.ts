@@ -186,7 +186,11 @@ export class MarketEngine {
         onCandles: (pair, candles) => this.onLiveCandles(pair, candles),
         onBalance: (b, cur) => { this.account.balance = b; this.account.currency = cur; },
         onStatus: (connected, reason) => {
-          this.log(connected ? 'info' : 'warn', `Quotex সংযোগ: ${connected ? 'সক্রিয়' : reason}`);
+          if (reason === 'rejected') {
+            this.log('warn', 'Quotex টোকেন প্রত্যাখ্যাত — নতুন টোকেন দরকার (পুরনো লাইন: Quotex সংযোগ: rejected)');
+          } else {
+            this.log(connected ? 'info' : 'warn', `Quotex সংযোগ: ${connected ? 'সক্রিয়' : reason}`);
+          }
           if (connected) {
             wsEverConnected = true;
             this.io?.emit('status', this.statusSnapshot());
@@ -203,14 +207,18 @@ export class MarketEngine {
       // আগে সব কেসেই ১৫ সে. অপেক্ষা হতো — টোকেন-ক্লিকে টাইমআউট রেস তৈরি করত।
       const probe = setInterval(() => {
         if (this.qx?.receivingTicks) {
-          finish(true, 'লাইভ টিক ডেটা চলছে');
+          finish(true, 'লাইভ Quotex টিক ডেটা চলছে');
+        } else if (this.qx?.authState === 'rejected') {
+          finish(false, 'টোকেন প্রত্যাখ্যাত — মেয়াদ শেষ/ভুল টোকেন। qxbroker.com-এ লগইন করে DevTools → Network → WS → authorization লাইন বা q9securid কুকি থেকে নতুন করে কপি করুন');
         } else if (firstFailAt && Date.now() - firstFailAt > 3000) {
-          finish(false, 'Quotex সার্ভারে পৌঁছানো যাচ্ছে না (টোকেন ভুল বা সার্ভার এই আইপি ব্লক করছে) — সিমুলেশনে আছি, ব্যাকগ্রাউন্ডে চেষ্টা চলবে');
+          finish(false, 'Quotex সার্ভারে পৌঁছানো যাচ্ছে না (নেটওয়ার্ক/আইপি ব্লক) — সিমুলেশনে আছি, ব্যাকগ্রাউন্ডে চেষ্টা চলবে');
         }
       }, 250);
       const hardTimeout = setTimeout(() => {
         if (this.qx?.receivingTicks) {
           finish(true, 'লাইভ টিক ডেটা চলছে');
+        } else if (this.qx?.authState === 'rejected') {
+          finish(false, 'টোকেন প্রত্যাখ্যাত — নতুন টোকেন নিন (DevTools → Network → WS → authorization লাইন)');
         } else if (!wsEverConnected) {
           finish(false, 'Quotex সংযোগ পাওয়া যায়নি (নেটওয়ার্ক/আইপি ব্লক) — সিমুলেশনে আছি, ব্যাকগ্রাউন্ডে চেষ্টা চলবে');
         } else {

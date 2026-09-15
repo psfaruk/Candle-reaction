@@ -31,10 +31,40 @@ process.on('warning', (w) => {
 const PORT = Number(process.env.QX_ENGINE_PORT || process.env.PORT || 3003);
 const NEXT_PORT = Number(process.env.QX_NEXT_PORT || 3000);
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** DB বুট — কখনো হাল ছাড়ে না (SQLite লক/IO হলে 2s পরে আবার) */
+async function bootDb(retries = 30): Promise<void> {
+  for (let i = 1; i <= retries; i++) {
+    try {
+      await ensureSchema();
+      await ensureSettings();
+      return;
+    } catch (e) {
+      console.error(`[qx-engine] ⚠ DB বুট ব্যর্থ (চেষ্টা ${i}/${retries}):`, e instanceof Error ? e.message : e);
+      await sleep(2000);
+    }
+  }
+  throw new Error('DB বুট বারবার ব্যর্থ');
+}
+
+/** পোর্ট বাইন্ড — EADDRINUSE হলে অপেক্ষা করে আবার */
+function listenForever(httpServer: import('http').Server, port: number): Promise<void> {
+  return new Promise((resolve) => {
+    const bind = () => {
+      httpServer.once('error', (e: Error) => {
+        console.error(`[qx-engine] ⚠ পোর্ট ${port} বাইন্ড ব্যর্থ (${e.message}) — 2s পরে আবার চেষ্টা`);
+        setTimeout(bind, 2000);
+      });
+      httpServer.listen(port, '0.0.0.0', () => resolve());
+    };
+    bind();
+  });
+}
+
 async function main() {
   // self-bootstrap: create tables if missing (fresh DB / new volume), then settings row
-  await ensureSchema();
-  await ensureSettings();
+  await bootDb();
 
   const httpServer = createServer();
   const io = new Server(httpServer, {
@@ -155,11 +185,28 @@ async function main() {
   // listen FIRST so /qx-health + the UI are reachable immediately —
   // history generation and the QX_TOKEN live-connect attempt happen in
   // engine.start() afterwards (socket RPCs stay safe: engine is constructed)
-  httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`[qx-engine] ✅ listening on 0.0.0.0:${PORT} (socket.io path /engine, health /qx-health, next proxy → :${NEXT_PORT}, pairs: ${ALL_PAIRS.length})`);
-  });
+  await listenForever(httpServer, PORT);
+  console.log(`[qx-engine] ✅ listening on 0.0.0.0:${PORT} (socket.io path /engine, health /qx-health, next proxy → :${NEXT_PORT}, pairs: ${ALL_PAIRS.length})`);
 
-  await engine.start(io);
+  // 🛡 লিসেনার সেল্ফ-হিল: কোনো কারণে পোর্ট মারা গেলে 5s পরে নিজে থেকেই পুনরায় বাইন্ড
+  // (sandbox auto-start এর পরেও ইঞ্জিন সারাক্ষণ চালু থাকবে)
+  setInterval(() => {
+    if (!httpServer.listening) {
+      console.warn('[qx-engine] ⚠ লিসেনার নেই — পুনরায় বাইন্ড করা হচ্ছে…');
+      try { httpServer.listen(PORT, '0.0.0.0'); } catch (e) { /* পরের টিকে আবার */ }
+    }
+  }, 5000);
+
+  // ইঞ্জিন স্টার্ট — DB হিকাপ হলে 3 বার চেষ্টা, তারপরও প্রসেস বাঁচিয়ে রাখি (health + proxy চালু)
+  for (let i = 1; i <= 3; i++) {
+    try {
+      await engine.start(io);
+      break;
+    } catch (e) {
+      console.error(`[qx-engine] ⚠ engine.start ব্যর্থ (চেষ্টা ${i}/3):`, e instanceof Error ? e.message : e);
+      if (i < 3) await sleep(3000);
+    }
+  }
 
   const shutdown = () => {
     console.log('[qx-engine] shutting down...');
@@ -170,7 +217,10 @@ async function main() {
   process.on('SIGINT', shutdown);
 }
 
+// FATAL হলেও মরবে না — 5s পরে পুরো বুট আবার (সুপারভাইজারের আগে নিজেই সারার চেষ্টা)
 main().catch((e) => {
-  console.error('[qx-engine] FATAL:', e);
-  process.exit(1);
+  console.error('[qx-engine] FATAL — 5s পরে পুনরায় বুট হবে:', e);
+  setInterval(() => {
+    main().catch((e2) => console.error('[qx-engine] রিবুটও ব্যর্থ:', e2));
+  }, 5000);
 });
