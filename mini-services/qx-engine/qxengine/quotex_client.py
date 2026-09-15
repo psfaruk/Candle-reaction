@@ -112,6 +112,9 @@ class QuotexClient:
         self._ws = None
         self._task = None
         self._demo_tried = {1: False, 0: False}
+        self._last_pong = time.time()
+        self._last_tick_ts = time.time()
+        self._send_lock = asyncio.Lock()   # সব WS send এক লাইনে — কোনো ফ্রেম হারাবে না
         self.set_pairs(pairs or [])
 
     # ---------------- public API ----------------
@@ -123,8 +126,11 @@ class QuotexClient:
             base = re.sub(r"_otc$", "", p, flags=re.I).upper()
             q = f"{base}_otc"
             self.pairs.append({"base": base, "qAsset": q})
-            self.pair_by_symbol[q] = base
-            self.pair_by_symbol.setdefault(base, base)
+            # প্রতিটি কেস-ফর্মে key রাখি — লুকআপ যেভাবেই আসুক (wire-এ
+            # "EURUSD_otc", হ্যান্ডলারে sym.upper() → "EURUSD_OTC") মিলবে।
+            self.pair_by_symbol[q] = base        # EURUSD_otc (wire form)
+            self.pair_by_symbol[q.upper()] = base  # EURUSD_OTC (upper lookups)
+            self.pair_by_symbol.setdefault(base, base)  # EURUSD
 
     @property
     def connected(self) -> bool:
@@ -195,9 +201,10 @@ class QuotexClient:
             self._pending_binary_event = None
             self._instruments_seen = False
             self._auth_sent = False
+            self._last_pong = time.time()
             self.ev.on_raw("→ [WS OPEN]")
             ws_open = True
-            first_fail_at = 0
+            hb_task = asyncio.create_task(self._heartbeat(ws))
 
             try:
                 while not self.closed and ws_open:
@@ -216,24 +223,52 @@ class QuotexClient:
                     else:
                         self._handle_text(msg)
             finally:
+                hb_task.cancel()
                 self._ws = None
+
+    async def _heartbeat(self, ws):
+        """Quotex-এর কাস্টম সার্ভার ক্লায়েন্টের পিং (EIO4-স্টাইল '2') আশা করে —
+        সার্ভার নিজে কখনো '2' পাঠায় না, আর নীরব ক্লায়েন্টকে ~30s পর কেটে দেয়
+        (পরীক্ষিত: প্রতি 10s-এ '2' পাঠালে 120s+ সংযোগ বাঁচে, টিক অবিচ্ছিন্ন)।
+        প্রতি 10s-এ '2' পাঠাই; 40s পর্যন্ত '3' পঙ্গ না এলে সকেট মৃত ধরে পুনঃসংযোগ।"""
+        while not self.closed:
+            await asyncio.sleep(10)
+            if self.closed or not _ws_open(ws):
+                return
+            try:
+                async with self._send_lock:
+                    await ws.send("2")
+            except Exception:
+                return
+            if time.time() - self._last_pong > 40:
+                self._log("Quotex হার্টবিট টাইমআউট (কোনো পঙ্গ নেই) — পুনঃসংযোগ হচ্ছে")
+                try:
+                    await ws.close(4000, "heartbeat timeout")
+                except Exception:
+                    pass
+                return
 
     # ---------------- protocol ----------------
 
-    def _send(self, raw: str):
+    async def _send(self, raw: str):
+        """সব সেন্ড এই এক লকের পথ দিয়ে — awaited, serialized, নিরাপদ।
+        (আগে fire-and-forget ছিল: হার্টবিটের সাথে রেস করে ফ্রেম হারাতো —
+        সার্ভার তখন quote-র header পাঠাতো কিন্তু binary স্ট্রিম বন্ধ রাখতো।)"""
         ws = self._ws
         if not _ws_open(ws):
             return
         self.ev.on_raw(f"→ {raw[:160]}")
-
-        async def _do():
-            try:
+        try:
+            async with self._send_lock:
                 await ws.send(raw)
-            except Exception:
-                pass
+        except Exception as e:
+            self.ev.on_raw(f"✗ send failed: {raw[:60]} → {type(e).__name__}: {e}")
+
+    def _send_bg(self, raw: str):
+        """সিঙ্ক কনটেক্সট থেকে ব্যাকগ্রাউন্ড সেন্ড।"""
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(_do())
+            loop.create_task(self._send(raw))
         except RuntimeError:
             pass
 
@@ -241,13 +276,25 @@ class QuotexClient:
         self.ev.on_log(m)
 
     def _handle_text(self, msg: str):
+        # ⚠ এক-অক্ষরের engine.io ফ্রেম সবার আগে — নিচের len<2 ফিল্টার নয়তো
+        # '3' (পঙ্গ) খেয়ে ফেলে, ফলে হার্টবিট ভুল টাইমআউট দেখায় আর সংযোগ কাটে।
+        if msg.startswith("3"):
+            self._last_pong = time.time()  # আমাদের '2' পিং-এর উত্তর এসেছে
+            self.ev.on_raw("← 3 (pong)")
+            return
+        if msg == "2":
+            self._send_bg("3")
+            return
+        if msg == "2probe":
+            self._send_bg("3probe")
+            return
         if len(msg) < 2:
             return
         if len(msg) < 300:
             self.ev.on_raw(f"← {msg[:160]}")
 
         if msg.startswith("0{"):
-            self._send("40")
+            self._send_bg("40")
             return
         if msg.startswith("40"):
             if self._auth_sent:
@@ -259,7 +306,7 @@ class QuotexClient:
             async def paced_auth():
                 # পেসিং গুরুত্বপূর্ণ: সাথে সাথে পাঠালে সার্ভার কানেকশন কেটে দেয়
                 await asyncio.sleep(1.2)
-                self._send("42" + json.dumps(["authorization", {
+                await self._send("42" + json.dumps(["authorization", {
                     "session": self.auth[0],
                     "isDemo": self.auth[1],
                     "tournamentId": 0,
@@ -267,10 +314,7 @@ class QuotexClient:
                 }], separators=(",", ":")))
             asyncio.get_running_loop().create_task(paced_auth())
             return
-        if msg == "2" or msg == "2probe":
-            self._send("3" if msg == "2" else "3probe")
-            return
-        if msg.startswith("3") or msg.startswith("41"):
+        if msg.startswith("41"):
             return
 
         # binary প্রিফেস হেডার: 451-["event",{"_placeholder":true}] / 51-["event",…]
@@ -389,7 +433,12 @@ class QuotexClient:
             except (TypeError, ValueError, AttributeError):
                 pass
             return
-        if evt in ("history/list/v2", "history/load", "success-instruments-candles",
+        if evt == "history/list/v2":
+            # এটা RAW টিক-হিস্টোরি: {"history": [[ts, price, dir], ...]} —
+            # ক্যান্ডেল নয়! (ভুল করে ক্যান্ডেল ভাবলে close=direction 0/1
+            # ঢুকে যায়।) আসল 1m ক্যান্ডেল history/load থেকেই আসে।
+            return
+        if evt in ("history/load", "success-instruments-candles",
                    "instruments-candles", "chart_notification/get"):
             self._handle_history_payload(data)
             return
@@ -483,7 +532,7 @@ class QuotexClient:
                 c = _num("close", "c")
             if t is None or not math.isfinite(t):
                 continue
-            t_ms = t if t > 1e12 else t * 1000
+            t_ms = int(t) if t > 1e12 else int(t * 1000)
             if None in (o, h, l, c):
                 if o is not None and c is not None:
                     h, l = max(o, c), min(o, c)
@@ -499,9 +548,23 @@ class QuotexClient:
     # ---------------- subscription ----------------
 
     async def _paced_subscribe(self):
-        """সাবস্ক্রিপশন মেসেজগুলো পেসড (120ms) — একসাথে পাঠালে সার্ভার কানেকশন কাটে।"""
+        """সাবস্ক্রিপশন + টিক-ওয়াচডগ। মেসেজগুলো পেসড (120ms) — একসাথে
+        পাঠালে সার্ভার কানেকশন কাটে। এরপর 15s পরপর চেক: অথেন্টিকেটেড সকেট
+        জীবিত কিন্তু 90s ধরে কোনো টিক না এলে সাবস্ক্রিপশন নীরবে হারিয়ে
+        গিয়েছে ধরে ব্যাচটা আবার পাঠাই (সংযোগ ভাঙে না)।"""
         if self.closed or self.auth_state != "ok":
             return
+        await self._send_subscription_batch()
+        while not self.closed and self.auth_state == "ok" and _ws_open(self._ws):
+            await asyncio.sleep(15)
+            if self.closed or self.auth_state != "ok" or not _ws_open(self._ws):
+                return
+            if time.time() - self._last_tick_ts > 90:
+                self._log("90s ধরে কোনো টিক আসেনি — সাবস্ক্রিপশন আবার পাঠানো হচ্ছে…")
+                self._last_tick_ts = time.time()
+                await self._send_subscription_batch()
+
+    async def _send_subscription_batch(self):
         sends = []
         for p in self.pairs:
             sends.append("42" + json.dumps(["instruments/update", {"asset": p["qAsset"], "period": 60}], separators=(",", ":")))
@@ -515,9 +578,15 @@ class QuotexClient:
         for i, s in enumerate(sends):
             if self.closed or not _ws_open(self._ws):
                 return
-            self._send(s)
+            await self._send(s)
             await asyncio.sleep(0.12)
 
     def _emit_tick(self, pair, price, t_ms):
         self.got_ticks = True
-        self.ev.on_tick(pair, price, t_ms)
+        self._last_tick_ts = time.time()
+        t_i = int(t_ms)  # epoch-সেকেন্ড float হলে ×1000-ও float থাকে — int লাগবেই
+        try:
+            self.ev.on_tick(pair, price, t_i)
+        except Exception as e:
+            # হ্যান্ডলারের বাগ কখনোই WS সেশন ভাঙবে না
+            self.ev.on_raw(f"⚠ on_tick handler: {type(e).__name__}: {e}")

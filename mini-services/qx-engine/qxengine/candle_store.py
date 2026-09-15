@@ -43,7 +43,7 @@ class RunningCandle:
         elif price < prev:
             self.down_ticks += 1
 
-        sec = min(59, (t - self.ts) // 1000)
+        sec = min(59, int((t - self.ts) // 1000))  # int() — float index guard
         color = "GREEN" if price > self.open else ("RED" if price < self.open else (self.sec_colors[sec] or "FLAT"))
         prev_color = self.sec_colors[sec] or "FLAT"
         self.sec_colors[sec] = color
@@ -132,6 +132,7 @@ class PairCandleStore:
         self.max_keep = max_keep
 
     def on_tick(self, t: int, price: float) -> str:
+        t = int(t)
         minute = (t // MINUTE) * MINUTE
         if not self.running or self.running.ts != minute:
             if self.running and self.running.ts > minute:

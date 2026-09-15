@@ -24,7 +24,32 @@ import socketio
 
 PORT = int(os.environ.get("QX_ENGINE_PORT") or os.environ.get("PORT") or 3003)
 NEXT_PORT = int(os.environ.get("QX_NEXT_PORT") or 3000)
-DB_URL = os.environ.get("DATABASE_URL") or "file:/home/z/my-project/db/custom.db"
+
+
+def _default_db_url() -> str:
+    """Smart default DB location — works with or without env vars.
+
+    Priority: DATABASE_URL env → /data (Railway volume) → legacy sandbox
+    path → db/qx.db next to the engine. (db.py creates parent dirs.)
+    """
+    env = os.environ.get("DATABASE_URL")
+    if env and not env.startswith("file:"):
+        return env  # e.g. a real external DB URL — use as-is
+    env_file = env[5:] if env and env.startswith("file:") else None
+    if env_file and os.path.dirname(env_file):
+        if os.path.isdir(os.path.dirname(env_file)) or os.access(os.path.dirname(env_file) or ".", os.W_OK):
+            return env
+    for d in ("/data",):
+        if os.path.isdir(d) and os.access(d, os.W_OK):
+            return f"file:{d}/qx.db"
+    legacy = "/home/z/my-project/db"
+    if os.path.isdir(legacy) and os.access(legacy, os.W_OK):
+        return f"file:{legacy}/custom.db"
+    here = os.path.dirname(os.path.abspath(__file__))
+    return f"file:{here}/db/qx.db"
+
+
+DB_URL = _default_db_url()
 
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
                "te", "trailers", "transfer-encoding", "upgrade", "host"}
@@ -208,6 +233,11 @@ async def health(request):
 
 
 async def proxy_to_next(request: web.Request) -> web.StreamResponse:
+    # NEVER proxy engine-prefixed paths back to Next — that would create an
+    # inter-process loop (Next rewrites /engine/* back to this engine).
+    if request.path == "/engine" or request.path.startswith("/engine/"):
+        return web.json_response({"error": "engine route not found",
+                                   "path": request.path}, status=404)
     if http_session is None:
         return web.Response(status=502, text="next-server unreachable (no session)")
     target = f"http://127.0.0.1:{NEXT_PORT}{request.rel_url}"
@@ -249,7 +279,7 @@ async def on_startup(app):
 
     if await _probe_existing():
         print(f"[qx-engine] পোর্ট {PORT}-এ একটি সুস্থ ইঞ্জিন আগেই চলছে — ডুপ্লিকেট বন্ধ করা হলো")
-        os._exit(0)
+        os._exit(42)  # 42 = ইচ্ছাকৃত বন্ধ (run.sh আর রিস্টার্ট করবে না)
 
     from qxengine.db import DB
     from qxengine.market_engine import MarketEngine
@@ -272,6 +302,7 @@ async def on_startup(app):
             except Exception as e2:
                 print(f"[qx-engine] রিস্টার্টও ব্যর্থ: {e2}")
     asyncio.create_task(_start_engine())
+    asyncio.create_task(_parent_watchdog())
     print(f"[qx-engine] ✅ Python engine listening on 0.0.0.0:{PORT} "
           f"(socket.io /engine, health /qx-health, next → :{NEXT_PORT})")
 
@@ -281,6 +312,26 @@ async def on_cleanup(app):
         await http_session.close()
     if engine is not None and engine.yahoo is not None:
         await engine.yahoo.stop()
+
+
+async def _parent_watchdog():
+    """If the process that spawned us (Next.js server) dies — exit cleanly,
+    so a replacement Next process can spawn a fresh engine (no orphans)."""
+    ppid_s = os.environ.get("QX_PARENT_PID", "").strip()
+    if not ppid_s.isdigit():
+        return
+    ppid = int(ppid_s)
+    if ppid <= 1:
+        return
+    while True:
+        await asyncio.sleep(5)
+        try:
+            os.kill(ppid, 0)
+        except ProcessLookupError:
+            print(f"[qx-engine] 👋 প্যারেন্ট (pid {ppid}) বন্ধ — ইঞ্জিনও বন্ধ হচ্ছে")
+            os._exit(42)  # 42 = ইচ্ছাকৃত বন্ধ (রিস্টার্ট নয়)
+        except PermissionError:
+            pass  # exists, owned by another user — still alive
 
 
 app.on_startup.append(on_startup)

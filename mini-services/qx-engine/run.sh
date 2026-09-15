@@ -26,8 +26,9 @@ fi
 while true; do
   "$PY" main.py
   code=$?
-  # main.py exits 0 on duplicate-guard → don't loop
-  [ "$code" -eq 0 ] && exit 0
+  # 42 = ইচ্ছাকৃত বন্ধ (duplicate-guard / প্যারেন্ট মৃত) — রিস্টার্ট নয়।
+  # সিগন্যাল/গ্রেসফুল শাটডাউন (0) বা ক্র্যাশ (≠0) — রিস্টার্ট করব।
+  [ "$code" -eq 42 ] && exit 0
   echo "[run.sh] engine exited ($code) — restarting in 2s"
   sleep 2
 done

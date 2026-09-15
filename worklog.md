@@ -196,3 +196,32 @@ Stage Summary:
 - অ্যাপ এখন রিয়েল-ডেটা-অনলি: Quotex টোকেন দিলে ws2.qxbroker.com টিক-বাই-টিক; টোকেন না থাকলে/মেয়াদ শেষ হলে রিয়েল ইন্টারব্যাংক ফিড — কখনো ফেক/সিম নয়
 - ইউজারের টোকেনটি মেয়াদোত্তীর্ণ (দুই স্বাধীন implementation-এ verify) — নতুন ssid টোকেন নিতে হবে
 - User action: Railway Redeploy → Settings-এ নতুন টোকেন পেস্ট → কয়েক সেকেন্ডে Quotex লাইভ
+
+---
+Task ID: 10
+Agent: main (Super Z)
+Task: "তুমি নিজেই দেখো কি সমস্যা" — deployed app-এ ডেটা আসে না (নতুন টোকেন নতুন টোকেন) — রুট-কজ ফিক্স + লাইভ Quotex ডেটা সচল
+
+Work Log:
+- Diagnosed deployed Railway app: /qx-health → Next 404 (prerendered), /engine/ → Next 308 trailing-slash redirect → public port-এ শুধু Next.js চলছে, Python engine কখনোই চালু হয়নি (service-level start command / builder override আমার start.sh বাইপাস করছে); frontend বিল্ড নতুন (04f567a-র স্ট্রিং) — মানে build fresh কিন্তু runtime engine-less
+- নতুন টোকেন নতুন টোকেন Python দিয়ে লাইভ টেস্ট: ws2.qxbroker.com EIO=3 → s_authorization ✓ (isDemo=1), টিক + ৮ পেয়ারের হিস্ট্রি ✓ — টোকেন সম্পূর্ণ কার্যকর
+- START-COMMAND-PROOF architecture: src/instrumentation.ts + src/instrumentation-engine.ts — Next সার্ভার বুট হলেই (যে কমান্ডেই চালু হোক: next start / node server.js / npm start / Dockerfile CMD) Python engine spawn হয় (:3003 internal); next.config.ts rewrites /engine + /qx-health → engine (skipTrailingSlashRedirect দরকার যেন /engine/-এর 308 আগে না ঘটে); package.json build mini-services-ও standalone-এ কপি করে
+- deploy/start.sh সরলীকৃত: এখন Next-ই $PORT-এ (public), engine spawn-এর দায়িত্ব instrumentation-এর — যেকোনো start command-এ একই আর্কিটেকচার
+- ⚠ Next standalone server.js বুটে cwd বদলে ফেলে (.next/standalone-এ) → instrumentation পুরোনো standalone কপি খুঁজে পেত — ফিক্স: source-tree অগ্রাধিকার (cwd + __filename উভয় থেকে walk-up, .next/standalone পাথ বাদ)
+- QuotexClient-এ ৫টি গভীর বাগ ফিক্স (tick-by-tick):
+  1) হার্টবিট: Quotex সার্ভার কখনো '2' পাঠায় না, নীরব ক্লায়েন্টকে ~30s-এ কেটে দেয় → প্রতি 10s-এ ক্লায়েন্ট-পিং '2' (পরীক্ষিত 120s+ টিকসহ বেঁচে থাকে), 40s পঙ্গ না এলে reconnect
+  2) পঙ্গ '3' (এক-অক্ষর ফ্রেম) len<2 ফিল্টারে খেয়ে যাচ্ছিল → এক-অক্ষর engine.io ফ্রেম এখন সবার আগে হ্যান্ডেল হয়
+  3) সব WS send এখন lock-কৃত awaited coroutine (আগে fire-and-forget race-এ ফ্রেম হারাতো)
+  4) pair_by_symbol কেস-মিসম্যাচ: key "EURUSD_otc" কিন্তু লুকআপ sym.upper()="EURUSD_OTC" → টিক এসেও নীরবে ড্রপ হতো! এখন সব কেস-ফর্মে key
+  5) history/list/v2 = raw টিক [ts,price,dir] — ক্যান্ডেল ভেবে close=direction(0/1) জাবারবেজ ঢুকতো → এখন স্কিপ (আসল ক্যান্ডেল history/load থেকে), DB থেকে ৫০টা জাবারবেজ রো পার্জ
+- টাইমস্ট্যাম্প float বাগ: epoch-সেকেন্ড float × 1000 → sec_colors[23.0] TypeError-তে সেশন ভাঙতো → int() রক্ষা + on_tick হ্যান্ডলার try/except (হ্যান্ডলার বাগ আর সেশন ভাঙবে না)
+- প্রসেস লাইফসাইকেল: exit 42 = ইচ্ছাকৃত বন্ধ (duplicate-guard/প্যারেন্ট-মৃত), অন্য সব exit → run.sh রিস্টার্ট; parent-watchdog (QX_PARENT_PID) — SIGKILL-এতিমও engine বন্ধ হয়; instrumentation duplicate → 20s রিচেক
+- main.py স্মার্ট DB ডিফল্ট (env → /data → legacy sandbox → engine-dir) + /engine/* কখনো Next-কে প্রক্সি হয় না (লুপ-প্রতিরোধ)
+- VERIFIED END-TO-END (:8080 প্রোডাকশন চেইন): engine auto-spawn source থেকে → Quotex auth → ৮ পেয়ারে লাইভ টিক + ১৪৬১-১৭৮৭ হিস্টোরিক্যাল ক্যান্ডেল → feedProvider=quotex liveConnected=true → ২.৫ মিনিটে ০ বিচ্ছিন্নতা → RPC get-market লাইভ প্রাইস (EURUSD 1.15279) → ব্রাউজারে "● লাইভ Quotex (টিক)", টিক ডিরেকশন, ০ console error → ইঞ্জিন মারলে self-heal ✓
+- BACKTEST (রিয়েল ডেটা): ১৫,১৫৪ ক্যান্ডেল → ১৫ সিগন্যাল @70% → ৯W/৬L = ৬০% WR (পেয়ার-ভিত্তিক ৫০-৭৫%)
+- সিক্রেট-স্ক্যান: scripts/ gitignored (টোকেন-ধারী টেস্ট ফাইল), staged diff-এ কোনো টোকেন নেই
+
+Stage Summary:
+- রুট কজ: Railway-র start command engine-কে চালুই করতো না + engine-এর ৫টি ডেটা-বাগ টিক প্রবাহ আটকে রাখছিল — সব ফিক্সড
+- অ্যাপ এখন যেকোনো হোস্ট/যেকোনো start command-এ কাজ করে; বৈধ টোকেন থাকলে কয়েক সেকেন্ডে লাইভ Quotex টিক-বাই-টিক ডেটা
+- User action: Railway Redeploy → Settings-এ টোকেন দরকার নেই যদি QX_TOKEN ভ্যারিয়েবল সেট থাকে, নাহলে Settings ট্যাবে পেস্ট → "● লাইভ Quotex (টিক)" দেখাবে
