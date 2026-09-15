@@ -1,0 +1,665 @@
+     1→import type { Server } from 'socket.io';
+     2→import type {
+     3→  Candle, EngineStatus, FeedSource, LogLine, MarketSnapshot, PairDef, PairMarketState,
+     4→  Reason, RunningCandleState, SignalRec, StatsBlock, PairStat, SignalFilter, LiveScorePreview,
+     5→} from '../types';
+     6→import { ALL_PAIRS, getPairDef } from '../pairs';
+     7→import { db } from '../db';
+     8→import { TickSimulator } from './simulator';
+     9→import { QuotexClient } from './quotex-client';
+    10→import { PairCandleStore } from './candle-store';
+    11→import { detectZones } from './levels';
+    12→import { evaluateSignal, previewRunningScore } from './signal-engine';
+    13→import { backtestPair, aggregateBacktest, type BTSummary, type BTSignal } from './backtest';
+    14→
+    15→const MINUTE = 60000;
+    16→const HISTORY_MINUTES = 2880; // 2 days
+    17→const LIVE_TICK_TIMEOUT = 15000;
+    18→
+    19→export class MarketEngine {
+    20→  private stores = new Map<string, PairCandleStore>();
+    21→  private sim: TickSimulator;
+    22→  private qx: QuotexClient | null = null;
+    23→  private io: Server | null = null;
+    24→
+    25→  feed: FeedSource = 'SIM';
+    26→  private desiredMode: 'auto' | 'live' | 'simulation' = 'auto';
+    27→  private activePairs: string[] = [];
+    28→  private minConfidence = 70;
+    29→  private qxToken: string | null = null;
+    30→  private tokenSource: 'env' | 'db' = 'db';
+    31→
+    32→  private lastMinute = 0;
+    33→  private pending = new Map<string, SignalRec>(); // pair -> awaiting resolution
+    34→  private lastLiveTickAt = 0;
+    35→
+    36→  private startedAt = Date.now();
+    37→  private logs: LogLine[] = [];
+    38→  private rawLog: string[] = [];
+    39→  private tickTimer: NodeJS.Timeout | null = null;
+    40→  private minuteTimer: NodeJS.Timeout | null = null;
+    41→  private broadcastTimer: NodeJS.Timeout | null = null;
+    42→  private account = { balance: null as number | null, currency: null as string | null, login: null as string | null };
+    43→  private signalsGenerated = 0;
+    44→
+    45→  constructor() {
+    46→    this.sim = new TickSimulator((m) => this.log('info', m));
+    47→  }
+    48→
+    49→  // ---------------- lifecycle ----------------
+    50→
+    51→  async start(io: Server) {
+    52→    this.io = io;
+    53→    const s = await db.setting.findUnique({ where: { id: 'main' } });
+    54→    this.minConfidence = s?.minConfidence ?? 70;
+    55→    this.desiredMode = (s?.mode as any) ?? 'auto';
+    56→    // QX_TOKEN env var wins (Railway Variables → fully automatic live setup)
+    57→    const envToken = (process.env.QX_TOKEN || '').trim();
+    58→    this.tokenSource = envToken ? 'env' : 'db';
+    59→    const token = envToken || s?.qxToken || null;
+    60→    this.activePairs = (s?.pairs ?? ALL_PAIRS.map((p) => p.symbol)).split(',').filter(Boolean);
+    61→
+    62→    this.log('info', `ইঞ্জিন চালু — ${this.activePairs.length}টি পেয়ার, মোড: ${this.desiredMode}${envToken ? ', টোকেন: QX_TOKEN env থেকে (অটো)' : ''}`);
+    63→
+    64→    // load / generate history for each pair
+    65→    for (const sym of this.activePairs) {
+    66→      await this.initPair(sym);
+    67→    }
+    68→
+    69→    // try live if token + mode allows
+    70→    if (token && this.desiredMode !== 'simulation') {
+    71→      await this.startLive(token);
+    72→    } else {
+    73→      this.log('info', token ? 'মোড simulation — লাইভ সংযোগ বন্ধ রাখা হয়েছে' : 'QX টোকেন নেই — সিমুলেশন ফিড চালু (Settings ট্যাব বা QX_TOKEN env ভ্যারিয়েবল থেকে টোকেন দিন)');
+    74→    }
+    75→
+    76→    this.lastMinute = Math.floor(Date.now() / MINUTE);
+    77→    // ensure running candles exist
+    78→    for (const sym of this.activePairs) {
+    79→      const st = this.stores.get(sym)!;
+    80→      if (!st.running) {
+    81→        const lastClose = st.candles.length ? st.candles[st.candles.length - 1].close : getPairDef(sym).basePrice;
+    82→        st.startRunning(this.lastMinute * MINUTE, lastClose);
+    83→        this.sim.initPair(getPairDef(sym), lastClose);
+    84→      }
+    85→    }
+    86→
+    87→    this.tickTimer = setInterval(() => this.simTickLoop(), 250);
+    88→    this.minuteTimer = setInterval(() => this.minuteWatcher(), 200);
+    89→    this.broadcastTimer = setInterval(() => this.broadcast(), 1000);
+    90→    this.log('info', 'ইঞ্জিন সম্পূর্ণ চালু — ক্যান্ডেল ক্লোজে সিগন্যাল মূল্যায়ন সক্রিয়');
+    91→  }
+    92→
+    93→  private async initPair(sym: string) {
+    94→    const def = getPairDef(sym);
+    95→    let candles = await this.loadCandlesFromDb(sym, 700);
+    96→    const nowMin = Math.floor(Date.now() / MINUTE);
+    97→    const haveFrom = candles.length ? candles[0].ts : 0;
+    98→    const wantFrom = (nowMin - HISTORY_MINUTES) * MINUTE;
+    99→    if (candles.length < 120 || haveFrom > wantFrom + 5 * MINUTE) {
+   100→      // not enough history → generate sim history for the missing stretch
+   101→      const genFrom = candles.length ? Math.max(wantFrom, candles[candles.length - 1].ts + MINUTE) : wantFrom;
+   102→      const minutes = Math.floor((nowMin * MINUTE - genFrom) / MINUTE);
+   103→      if (minutes > 5) {
+   104→        this.log('info', `[${sym}] ${minutes} মিনিট সিমুলেশন হিস্ট্রি তৈরি হচ্ছে...`);
+   105→        const gen = this.sim.generateHistory(def, minutes, nowMin * MINUTE);
+   106→        await this.persistCandles(gen);
+   107→        candles = await this.loadCandlesFromDb(sym, 700);
+   108→      }
+   109→    }
+   110→    const store = new PairCandleStore(sym);
+   111→    for (const c of candles) store.appendClosed(c);
+   112→    this.stores.set(sym, store);
+   113→    const lastPrice = candles.length ? candles[candles.length - 1].close : def.basePrice;
+   114→    this.sim.initPair(def, lastPrice);
+   115→  }
+   116→
+   117→  private async loadCandlesFromDb(sym: string, take: number): Promise<Candle[]> {
+   118→    const rows = await db.candle.findMany({ where: { pair: sym }, orderBy: { ts: 'desc' }, take });
+   119→    return rows
+   120→      .map((r) => ({
+   121→        pair: r.pair,
+   122→        ts: r.ts.getTime(),
+   123→        open: r.open, high: r.high, low: r.low, close: r.close,
+   124→        ticks: r.ticks, upTicks: r.upTicks, downTicks: r.downTicks,
+   125→        lateFlip: r.lateFlip, lateMomentum: r.lateMomentum, flipCount: r.flipCount,
+   126→        source: r.source as FeedSource,
+   127→      }))
+   128→      .sort((a, b) => a.ts - b.ts);
+   129→  }
+   130→
+   131→  private async persistCandles(cs: Candle[]) {
+   132→    if (!cs.length) return;
+   133→    try {
+   134→      // SQLite prisma has no skipDuplicates → filter out existing ids first
+   135→      const pairs = [...new Set(cs.map((c) => c.pair))];
+   136→      const from = Math.min(...cs.map((c) => c.ts));
+   137→      const to = Math.max(...cs.map((c) => c.ts));
+   138→      const existing = await db.candle.findMany({
+   139→        where: { pair: { in: pairs }, ts: { gte: new Date(from), lte: new Date(to) } },
+   140→        select: { id: true },
+   141→      });
+   142→      const existSet = new Set(existing.map((e) => e.id));
+   143→      const fresh = cs.filter((c) => !existSet.has(`${c.pair}:${c.ts}`));
+   144→      for (let i = 0; i < fresh.length; i += 500) {
+   145→        const chunk = fresh.slice(i, i + 500).map((c) => ({
+   146→          id: `${c.pair}:${c.ts}`,
+   147→          pair: c.pair,
+   148→          ts: new Date(c.ts),
+   149→          open: c.open, high: c.high, low: c.low, close: c.close,
+   150→          ticks: c.ticks, upTicks: c.upTicks, downTicks: c.downTicks,
+   151→          lateFlip: c.lateFlip, lateMomentum: c.lateMomentum, flipCount: c.flipCount,
+   152→          source: c.source,
+   153→        }));
+   154→        try {
+   155→          await db.candle.createMany({ data: chunk });
+   156→        } catch { /* ignore chunk-level races */ }
+   157→      }
+   158→    } catch {
+   159→      // DB lock/IO হলে এই ব্যাচ বাদ — ইঞ্জিন কখনো মরবে না, পরের মিনিটে আবার লেখা হবে
+   160→    }
+   161→  }
+   162→
+   163→  // ---------------- live feed ----------------
+   164→
+   165→  async startLive(token: string): Promise<{ ok: boolean; msg: string }> {
+   166→    this.stopLive();
+   167→    this.qxToken = token;
+   168→    this.tokenSource = token === (process.env.QX_TOKEN || '').trim() ? 'env' : 'db';
+   169→    try {
+   170→      await db.setting.update({ where: { id: 'main' }, data: { qxToken: token } });
+   171→    } catch { /* টোকেন সেভ ব্যর্থ হলেও লাইভ চেষ্টা চলবে */ }
+   172→    return new Promise((resolve) => {
+   173→      let settled = false;
+   174→      let wsEverConnected = false;
+   175→      let firstFailAt = 0;
+   176→      const finish = (ok: boolean, msg: string) => {
+   177→        if (settled) return;
+   178→        settled = true;
+   179→        clearInterval(probe);
+   180→        clearTimeout(hardTimeout);
+   181→        if (!ok) this.feed = 'SIM';
+   182→        resolve({ ok, msg });
+   183→      };
+   184→      this.qx = new QuotexClient(token, {
+   185→        onTick: (pair, price, t) => this.onLiveTick(pair, price, t),
+   186→        onCandles: (pair, candles) => this.onLiveCandles(pair, candles),
+   187→        onBalance: (b, cur) => { this.account.balance = b; this.account.currency = cur; },
+   188→        onStatus: (connected, reason) => {
+   189→          this.log(connected ? 'info' : 'warn', `Quotex সংযোগ: ${connected ? 'সক্রিয়' : reason}`);
+   190→          if (connected) {
+   191→            wsEverConnected = true;
+   192→            this.io?.emit('status', this.statusSnapshot());
+   193→          } else if (!wsEverConnected && !firstFailAt) {
+   194→            firstFailAt = Date.now();
+   195→          }
+   196→        },
+   197→        onRaw: (line) => this.pushRaw(line),
+   198→        onLog: (m) => this.log('info', m),
+   199→      });
+   200→      this.qx.connect(this.activePairs);
+   201→      // ⚡ দ্রুত উত্তর: প্রথম লাইভ টিক এলেই সফল; WS কখনো খুলেনি + ৩ সে. কেটে গেলে
+   202→      // দ্রুত-ব্যর্থ (স্পষ্ট কারণসহ); সর্বোচ্চ সীমা LIVE_TICK_TIMEOUT।
+   203→      // আগে সব কেসেই ১৫ সে. অপেক্ষা হতো — টোকেন-ক্লিকে টাইমআউট রেস তৈরি করত।
+   204→      const probe = setInterval(() => {
+   205→        if (this.qx?.receivingTicks) {
+   206→          finish(true, 'লাইভ টিক ডেটা চলছে');
+   207→        } else if (firstFailAt && Date.now() - firstFailAt > 3000) {
+   208→          finish(false, 'Quotex সার্ভারে পৌঁছানো যাচ্ছে না (টোকেন ভুল বা সার্ভার এই আইপি ব্লক করছে) — সিমুলেশনে আছি, ব্যাকগ্রাউন্ডে চেষ্টা চলবে');
+   209→        }
+   210→      }, 250);
+   211→      const hardTimeout = setTimeout(() => {
+   212→        if (this.qx?.receivingTicks) {
+   213→          finish(true, 'লাইভ টিক ডেটা চলছে');
+   214→        } else if (!wsEverConnected) {
+   215→          finish(false, 'Quotex সংযোগ পাওয়া যায়নি (নেটওয়ার্ক/আইপি ব্লক) — সিমুলেশনে আছি, ব্যাকগ্রাউন্ডে চেষ্টা চলবে');
+   216→        } else {
+   217→          finish(false, 'সংযোগ হয়েছে কিন্তু টিক ডেটা আসেনি — সিমুলেশনে ফিরে গেছে (টোকেন/পেয়ার চেক করুন)');
+   218→        }
+   219→      }, LIVE_TICK_TIMEOUT);
+   220→    });
+   221→  }
+   222→
+   223→  stopLive() {
+   224→    if (this.qx) {
+   225→      this.qx.close();
+   226→      this.qx = null;
+   227→    }
+   228→    this.feed = 'SIM';
+   229→  }
+   230→
+   231→  private onLiveTick(pair: string, price: number, t: number) {
+   232→    if (!this.stores.has(pair)) return;
+   233→    this.lastLiveTickAt = t;
+   234→    if (this.feed !== 'LIVE') {
+   235→      this.feed = 'LIVE';
+   236→      this.log('info', `লাইভ Quotex টিক ডেটা সক্রিয় হলো (${pair})`);
+   237→      this.io?.emit('status', this.statusSnapshot());
+   238→      // re-anchor sim to live price to avoid future jumps
+   239→      this.sim.initPair(getPairDef(pair), price);
+   240→    }
+   241→    this.onTick(pair, price, t, 'LIVE');
+   242→  }
+   243→
+   244→  private onLiveCandles(pair: string, candles: { t: number; o: number; h: number; l: number; c: number }[]) {
+   245→    const store = this.stores.get(pair);
+   246→    if (!store || !candles.length) return;
+   247→    this.log('info', `[${pair}] Quotex থেকে ${candles.length}টি হিস্টোরিক্যাল ক্যান্ডেল পাওয়া গেছে`);
+   248→    const mapped: Candle[] = candles
+   249→      .filter((c) => Number.isFinite(c.o) && Number.isFinite(c.c))
+   250→      .map((c) => ({
+   251→        pair, ts: Math.floor(c.t / MINUTE) * MINUTE,
+   252→        open: c.o, high: Math.max(c.h, c.o, c.c), low: Math.min(c.l, c.o, c.c), close: c.c,
+   253→        ticks: 0, upTicks: 0, downTicks: 0, lateFlip: 0, lateMomentum: 0, flipCount: 0,
+   254→        source: 'LIVE' as const,
+   255→      }));
+   256→    void this.persistCandles(mapped).catch(() => {});
+   257→    // merge into memory (replace sim candles in overlapping range)
+   258→    const liveFrom = mapped.length ? mapped[0].ts : 0;
+   259→    store.candles = store.candles.filter((c) => c.ts < liveFrom || c.source === 'LIVE');
+   260→    for (const c of mapped) if (!store.candles.some((x) => x.ts === c.ts)) store.appendClosed(c);
+   261→    store.candles.sort((a, b) => a.ts - b.ts);
+   262→  }
+   263→
+   264→  // ---------------- tick & minute pipeline ----------------
+   265→
+   266→  private simTickLoop() {
+   267→    const now = Date.now();
+   268→    const liveActive = this.feed === 'LIVE' && this.qx?.connected && now - this.lastLiveTickAt < LIVE_TICK_TIMEOUT;
+   269→    if (liveActive) return; // live feed owns the ticks
+   270→    if (this.feed === 'LIVE' && now - this.lastLiveTickAt >= LIVE_TICK_TIMEOUT) {
+   271→      this.feed = 'SIM';
+   272→      this.log('warn', 'লাইভ টিক বন্ধ হয়ে গেছে — সিমুলেশন ফিড পুনরায় চালু (দাম ধারাবাহিক রাখা হয়েছে)');
+   273→      this.io?.emit('status', this.statusSnapshot());
+   274→    }
+   275→    for (const sym of this.activePairs) {
+   276→      const t = this.sim.nextTick(sym, now);
+   277→      if (t) this.onTick(sym, t.price, t.t, 'SIM');
+   278→    }
+   279→  }
+   280→
+   281→  private onTick(pair: string, price: number, t: number, source: FeedSource) {
+   282→    const store = this.stores.get(pair);
+   283→    if (!store) return;
+   284→    const minute = Math.floor(t / MINUTE) * MINUTE;
+   285→    if (!store.running || store.running.ts !== minute) {
+   286→      if (store.running && store.running.ts > minute) return;
+   287→      const openRef = store.running ? store.running.last : store.candles.length ? store.candles[store.candles.length - 1].close : price;
+   288→      store.startRunning(minute, openRef);
+   289→    }
+   290→    store.running!.onTick({ t, price });
+   291→  }
+   292→
+   293→  private minuteWatcher() {
+   294→    const now = Date.now();
+   295→    const cur = Math.floor(now / MINUTE);
+   296→    if (cur <= this.lastMinute) return;
+   297→    const closedMinute = this.lastMinute;
+   298→    this.lastMinute = cur;
+   299→    for (const sym of this.activePairs) {
+   300→      const store = this.stores.get(sym);
+   301→      if (!store) continue;
+   302→      const runTs = store.running?.ts ?? 0;
+   303→      if (store.running && runTs === closedMinute * MINUTE) {
+   304→        this.closeCandle(sym, store, now);
+   305→      } else if (store.running && runTs < closedMinute * MINUTE) {
+   306→        // stale candle (missed ticks) — close it too
+   307→        this.closeCandle(sym, store, now);
+   308→      }
+   309→      // start the fresh candle at current minute
+   310→      const openRef = store.candles.length ? store.candles[store.candles.length - 1].close : getPairDef(sym).basePrice;
+   311→      if (!store.running || store.running.ts !== cur * MINUTE) {
+   312→        store.startRunning(cur * MINUTE, openRef);
+   313→      }
+   314→    }
+   315→  }
+   316→
+   317→  private closeCandle(sym: string, store: PairCandleStore, now: number) {
+   318→    const source: FeedSource = this.feed;
+   319→    const candle = store.closeCurrent(now, source);
+   320→    if (!candle) return;
+   321→    void this.persistCandles([candle]).catch(() => {});
+   322→
+   323→    // 1) resolve previous pending signal with THIS candle's close
+   324→    const pend = this.pending.get(sym);
+   325→    if (pend && pend.ts === candle.ts - MINUTE) {
+   326→      pend.closePrice = candle.close;
+   327→      pend.result =
+   328→        candle.close === pend.entryPrice
+   329→          ? 'TIE'
+   330→          : (pend.direction === 'CALL' ? (candle.close > pend.entryPrice ? 'WIN' : 'LOSS') : candle.close < pend.entryPrice ? 'WIN' : 'LOSS');
+   331→      this.pending.delete(sym);
+   332→      void db.signal.update({ where: { id: pend.id }, data: { closePrice: candle.close, result: pend.result } }).catch(() => {});
+   333→      this.io?.emit('signal:resolved', pend);
+   334→      this.log('info', `[${sym}] ${pend.direction} সিগন্যাল ${pend.result === 'WIN' ? 'উইন ✓' : pend.result === 'LOSS' ? 'লস ✗' : 'টাই'} (${pend.confidence}%)`);
+   335→    }
+   336→
+   337→    // 2) evaluate new signal at FULL candle close (the user's core requirement)
+   338→    const def = getPairDef(sym);
+   339→    const ev = evaluateSignal({ candles: store.candles, last: store.candles.length - 1, def });
+   340→    if (ev && ev.score >= this.minConfidence) {
+   341→      const rec: SignalRec = {
+   342→        id: `sig_${sym}_${candle.ts}`,
+   343→        pair: sym,
+   344→        ts: candle.ts + MINUTE, // trade entry = next minute open
+   345→        direction: ev.direction,
+   346→        confidence: ev.score,
+   347→        score: ev.score,
+   348→        reasons: ev.reasons,
+   349→        entryPrice: candle.close,
+   350→        closePrice: null,
+   351→        result: 'PENDING',
+   352→        source,
+   353→      };
+   354→      this.pending.set(sym, rec);
+   355→      this.signalsGenerated += 1;
+   356→      void db.signal
+   357→        .create({
+   358→          data: {
+   359→            id: rec.id, pair: sym, ts: new Date(rec.ts), direction: rec.direction,
+   360→            confidence: rec.confidence, score: rec.score, reasons: JSON.stringify(rec.reasons),
+   361→            entryPrice: rec.entryPrice, result: 'PENDING', source,
+   362→          },
+   363→        })
+   364→        .catch(() => {});
+   365→      this.io?.emit('signal:new', rec);
+   366→      this.log('info', `[${sym}] নতুন সিগন্যাল: ${rec.direction} @ ${rec.entryPrice.toFixed(def.digits)} (${ev.score}% কনফিডেন্স)`);
+   367→    }
+   368→
+   369→    this.io?.emit('candle:closed', { pair: sym, candle });
+   370→  }
+   371→
+   372→  // ---------------- broadcast & snapshots ----------------
+   373→
+   374→  private broadcast() {
+   375→    if (!this.io) return;
+   376→    this.io.emit('market', this.snapshot());
+   377→  }
+   378→
+   379→  statusSnapshot(): EngineStatus {
+   380→    return {
+   381→      mode: this.feed,
+   382→      desiredMode: this.desiredMode,
+   383→      liveConnected: !!this.qx?.connected && this.feed === 'LIVE',
+   384→      socketClients: this.io?.sockets.sockets.size ?? 0,
+   385→      serverTime: Date.now(),
+   386→      accountBalance: this.account.balance,
+   387→      currency: this.account.currency,
+   388→      login: this.account.login,
+   389→      activePairs: [...this.activePairs],
+   390→      minConfidence: this.minConfidence,
+   391→      uptimeSec: Math.floor((Date.now() - this.startedAt) / 1000),
+   392→      historyMinutes: HISTORY_MINUTES,
+   393→    };
+   394→  }
+   395→
+   396→  snapshot(): MarketSnapshot {
+   397→    const now = Date.now();
+   398→    const pairs: PairMarketState[] = this.activePairs.map((sym) => {
+   399→      const def = getPairDef(sym);
+   400→      const store = this.stores.get(sym)!;
+   401→      const run = store.running;
+   402→      const lastClosed = store.candles.length ? store.candles[store.candles.length - 1] : null;
+   403→      const price = run?.last ?? lastClosed?.close ?? def.basePrice;
+   404→      const zones = detectZones(store.candles, def.pip, price);
+   405→      const pip = def.pip;
+   406→
+   407→      let running: RunningCandleState;
+   408→      if (run) {
+   409→        const near = zones
+   410→          .map((z) => ({ z, d: (price - z.price) / pip }))
+   411→          .sort((a, b) => Math.abs(a.d) - Math.abs(b.d))[0];
+   412→        const live = run.toPseudoCandle(this.feed);
+   413→        const preview = previewRunningScore(store.candles, live, def);
+   414→        running = {
+   415→          pair: sym,
+   416→          ts: run.ts,
+   417→          open: run.open, high: run.high, low: run.low, last: run.last,
+   418→          secondsLeft: 60 - Math.floor(((now - run.ts) % MINUTE) / 1000),
+   419→          color: run.color,
+   420→          ticks: run.ticks, upTicks: run.upTicks, downTicks: run.downTicks,
+   421→          tickImbalance: run.ticks ? Number(((run.upTicks - run.downTicks) / run.ticks).toFixed(2)) : 0,
+   422→          momentum5s: run.momentum(5, pip, now),
+   423→          momentum10s: run.momentum(10, pip, now),
+   424→          colorFlips: run.flips.length,
+   425→          lastFlipAtSec: run.flips.length ? run.flips[run.flips.length - 1] : -1,
+   426→          upperWickPips: Number(((run.high - Math.max(run.open, run.last)) / pip).toFixed(1)),
+   427→          lowerWickPips: Number(((Math.min(run.open, run.last) - run.low) / pip).toFixed(1)),
+   428→          nearZone: near && Math.abs(near.d) < 30
+   429→            ? { side: near.z.side, price: near.z.price, distancePips: Number(near.d.toFixed(1)), strength: near.z.strength }
+   430→            : null,
+   431→          liveScore: preview ? { direction: preview.direction, score: preview.score, reasons: preview.reasons } : null,
+   432→        };
+   433→      } else {
+   434→        running = {
+   435→          pair: sym, ts: now, open: price, high: price, low: price, last: price, secondsLeft: 0,
+   436→          color: 'FLAT', ticks: 0, upTicks: 0, downTicks: 0, tickImbalance: 0, momentum5s: 0, momentum10s: 0,
+   437→          colorFlips: 0, lastFlipAtSec: -1, upperWickPips: 0, lowerWickPips: 0, nearZone: null, liveScore: null,
+   438→        };
+   439→      }
+   440→
+   441→      return {
+   442→        pair: sym, name: def.name, digits: def.digits, price,
+   443→        changePips1m: lastClosed ? Number(((lastClosed.close - lastClosed.open) / pip).toFixed(1)) : 0,
+   444→        running, lastClosed,
+   445→      };
+   446→    });
+   447→
+   448→    return {
+   449→      status: this.statusSnapshot(),
+   450→      pairs,
+   451→      pendingSignals: [...this.pending.values()],
+   452→    };
+   453→  }
+   454→
+   455→  getHistory(pair: string, limit = 180): Candle[] {
+   456→    const store = this.stores.get(pair);
+   457→    if (!store) return [];
+   458→    const closed = store.candles.slice(-limit);
+   459→    if (store.running) {
+   460→      const run = store.running;
+   461→      closed.push({
+   462→        pair, ts: run.ts, open: run.open, high: run.high, low: run.low, close: run.last,
+   463→        ticks: run.ticks, upTicks: run.upTicks, downTicks: run.downTicks,
+   464→        lateFlip: 0, lateMomentum: 0, flipCount: run.flips.length, source: this.feed,
+   465→      });
+   466→    }
+   467→    return closed;
+   468→  }
+   469→
+   470→  // ---------------- signals & stats (DB) ----------------
+   471→
+   472→  async getSignals(f: SignalFilter): Promise<SignalRec[]> {
+   473→    const where: any = {};
+   474→    if (f.pair && f.pair !== 'ALL') where.pair = f.pair;
+   475→    if (f.direction && f.direction !== 'ALL') where.direction = f.direction;
+   476→    const sources = f.source && f.source.length ? f.source : ['LIVE', 'SIM'];
+   477→    where.source = { in: sources };
+   478→    if (f.periodH && f.periodH > 0) where.ts = { gte: new Date(Date.now() - f.periodH * 3600000) };
+   479→    const rows = await db.signal.findMany({ where, orderBy: { ts: 'desc' }, take: Math.min(f.limit ?? 100, 500) });
+   480→    return rows.map((r) => ({
+   481→      id: r.id, pair: r.pair, ts: r.ts.getTime(), direction: r.direction as any,
+   482→      confidence: r.confidence, score: r.score, reasons: JSON.parse(r.reasons || '[]'),
+   483→      entryPrice: r.entryPrice, closePrice: r.closePrice, result: r.result as any, source: r.source as any,
+   484→    }));
+   485→  }
+   486→
+   487→  async getStats(f: { periodH?: number; source?: string[] }): Promise<{ overall: StatsBlock; perPair: PairStat[] }> {
+   488→    const where: any = {};
+   489→    const sources = f.source && f.source.length ? f.source : ['LIVE', 'SIM'];
+   490→    where.source = { in: sources };
+   491→    if (f.periodH && f.periodH > 0) where.ts = { gte: new Date(Date.now() - f.periodH * 3600000) };
+   492→    const rows = await db.signal.findMany({ where, orderBy: { ts: 'desc' }, take: 3000 });
+   493→
+   494→    const mk = (list: typeof rows): StatsBlock => {
+   495→      const wins = list.filter((r) => r.result === 'WIN').length;
+   496→      const losses = list.filter((r) => r.result === 'LOSS').length;
+   497→      const ties = list.filter((r) => r.result === 'TIE').length;
+   498→      const pending = list.filter((r) => r.result === 'PENDING').length;
+   499→      const call = list.filter((r) => r.direction === 'CALL');
+   500→      const put = list.filter((r) => r.direction === 'PUT');
+   501→      const cW = call.filter((r) => r.result === 'WIN').length;
+   502→      const pW = put.filter((r) => r.result === 'WIN').length;
+   503→      // streak over chronological order
+   504→      const chrono = [...list].sort((a, b) => a.ts.getTime() - b.ts.getTime()).filter((r) => r.result === 'WIN' || r.result === 'LOSS');
+   505→      let cur = 0, maxW = 0, maxL = 0, curType: 'W' | 'L' | null = null;
+   506→      for (const r of chrono) {
+   507→        const t = r.result === 'WIN' ? 'W' : 'L';
+   508→        if (t === curType) cur += 1;
+   509→        else { curType = t; cur = 1; }
+   510→        if (t === 'W') maxW = Math.max(maxW, cur);
+   511→        else maxL = Math.max(maxL, cur);
+   512→      }
+   513→      const decided = wins + losses;
+   514→      return {
+   515→        total: list.length, wins, losses, ties, pending,
+   516→        winRate: decided ? Math.round((wins / decided) * 100) : 0,
+   517→        call: { total: call.length, wins: cW, losses: call.filter((r) => r.result === 'LOSS').length, ties: call.filter((r) => r.result === 'TIE').length, winRate: cW + call.filter((r) => r.result === 'LOSS').length ? Math.round((cW / (cW + call.filter((r) => r.result === 'LOSS').length)) * 100) : 0 },
+   518→        put: { total: put.length, wins: pW, losses: put.filter((r) => r.result === 'LOSS').length, ties: put.filter((r) => r.result === 'TIE').length, winRate: pW + put.filter((r) => r.result === 'LOSS').length ? Math.round((pW / (pW + put.filter((r) => r.result === 'LOSS').length)) * 100) : 0 },
+   519→        streak: { current: cur, maxWin: maxW, maxLoss: maxL, currentType: curType },
+   520→      };
+   521→    };
+   522→
+   523→    const overall = mk(rows);
+   524→    const perPair: PairStat[] = this.activePairs.map((sym) => {
+   525→      const s = mk(rows.filter((r) => r.pair === sym));
+   526→      return { ...s, pair: sym };
+   527→    });
+   528→    return { overall, perPair };
+   529→  }
+   530→
+   531→  // ---------------- settings ----------------
+   532→
+   533→  async saveSettings(patch: { pairs?: string[]; minConfidence?: number; mode?: string }): Promise<{ ok: boolean; msg: string }> {
+   534→    if (patch.minConfidence != null) {
+   535→      this.minConfidence = Math.max(50, Math.min(95, Math.round(patch.minConfidence)));
+   536→    }
+   537→    if (patch.mode && ['auto', 'live', 'simulation'].includes(patch.mode)) {
+   538→      this.desiredMode = patch.mode as any;
+   539→      if (patch.mode === 'simulation') this.stopLive();
+   540→    }
+   541→    if (patch.pairs && patch.pairs.length) {
+   542→      const valid = patch.pairs.filter((p) => ALL_PAIRS.some((d) => d.symbol === p));
+   543→      for (const sym of valid) {
+   544→        if (!this.stores.has(sym)) {
+   545→          this.activePairs.push(sym);
+   546→          await this.initPair(sym);
+   547→          const store = this.stores.get(sym)!;
+   548→          store.startRunning(Math.floor(Date.now() / MINUTE) * MINUTE, store.candles.length ? store.candles[store.candles.length - 1].close : getPairDef(sym).basePrice);
+   549→          this.log('info', `[${sym}] পেয়ার সক্রিয় করা হলো`);
+   550→        }
+   551→      }
+   552→      for (const sym of [...this.stores.keys()]) {
+   553→        if (!valid.includes(sym)) {
+   554→          this.stores.delete(sym);
+   555→          this.sim.removePair(sym);
+   556→          this.activePairs = this.activePairs.filter((p) => p !== sym);
+   557→          this.pending.delete(sym);
+   558→          this.log('info', `[${sym}] পেয়ার বন্ধ করা হলো`);
+   559→        }
+   560→      }
+   561→      if (this.qx) this.qx.connect(this.activePairs);
+   562→    }
+   563→    await db.setting.update({
+   564→      where: { id: 'main' },
+   565→      data: {
+   566→        minConfidence: this.minConfidence,
+   567→        mode: this.desiredMode,
+   568→        pairs: this.activePairs.join(','),
+   569→      },
+   570→    });
+   571→    this.io?.emit('status', this.statusSnapshot());
+   572→    return { ok: true, msg: 'সেটিংস সংরক্ষিত' };
+   573→  }
+   574→
+   575→  getTokenMasked(): string {
+   576→    if (!this.qxToken) return '';
+   577→    const t = this.qxToken;
+   578→    return t.length <= 10 ? '••••' : `${t.slice(0, 6)}••••••${t.slice(-4)}`;
+   579→  }
+   580→
+   581→  getSettings() {
+   582→    return {
+   583→      tokenMasked: this.getTokenMasked(),
+   584→      tokenSource: this.tokenSource,
+   585→      mode: this.desiredMode,
+   586→      minConfidence: this.minConfidence,
+   587→      pairs: [...this.activePairs],
+   588→      allPairs: ALL_PAIRS.map((p) => ({ symbol: p.symbol, name: p.name })),
+   589→    };
+   590→  }
+   591→
+   592→  // ---------------- backtest ----------------
+   593→
+   594→  async runBacktest(): Promise<BTSummary> {
+   595→    const t0 = Date.now();
+   596→    await db.signal.deleteMany({ where: { source: 'BACKTEST' } });
+   597→    const perPair: BTSummary['perPair'] = [];
+   598→    const allSignals: BTSignal[] = [];
+   599→    let candlesTested = 0;
+   600→    let from = Infinity, to = -Infinity;
+   601→
+   602→    for (const sym of this.activePairs) {
+   603→      const def = getPairDef(sym);
+   604→      // use up to 2 days of candles from the DB (more robust than RAM store)
+   605→      const rows = await db.candle.findMany({ where: { pair: sym }, orderBy: { ts: 'desc' }, take: 2000 });
+   606→      const hist = rows
+   607→        .map((r) => ({
+   608→          pair: r.pair, ts: r.ts.getTime(),
+   609→          open: r.open, high: r.high, low: r.low, close: r.close,
+   610→          ticks: r.ticks, upTicks: r.upTicks, downTicks: r.downTicks,
+   611→          lateFlip: r.lateFlip, lateMomentum: r.lateMomentum, flipCount: r.flipCount,
+   612→          source: r.source as FeedSource,
+   613→        }))
+   614→        .sort((a, b) => a.ts - b.ts);
+   615→      if (hist.length < 60) continue;
+   616→      const { signals, result } = backtestPair(sym, hist, def, this.minConfidence);
+   617→      perPair.push(result);
+   618→      allSignals.push(...signals);
+   619→      candlesTested += hist.length;
+   620→      from = Math.min(from, hist[0].ts);
+   621→      to = Math.max(to, hist[hist.length - 1].ts);
+   622→
+   623→      // persist backtest signals (cap per pair to keep DB light)
+   624→      const cap = signals.slice(-400);
+   625→      for (let i = 0; i < cap.length; i += 250) {
+   626→        const chunk = cap.slice(i, i + 250).map((s) => ({
+   627→          pair: s.pair, ts: new Date(s.ts), direction: s.direction, confidence: s.score, score: s.score,
+   628→          reasons: JSON.stringify(s.reasons), entryPrice: s.entryPrice, closePrice: s.closePrice,
+   629→          result: s.result, source: 'BACKTEST', backtestId: 'bt',
+   630→        }));
+   631→        try { await db.signal.createMany({ data: chunk }); } catch { /* noop */ }
+   632→      }
+   633→    }
+   634→
+   635→    const id = `bt_${Date.now()}`;
+   636→    const summary = aggregateBacktest(id, this.minConfidence, perPair, allSignals, candlesTested, from === Infinity ? 0 : from, to === -Infinity ? 0 : to);
+   637→    await db.setting.update({ where: { id: 'main' }, data: { lastBacktest: JSON.stringify(summary) } });
+   638→    this.log('info', `ব্যাকটেস্ট সম্পন্ন ${((Date.now() - t0) / 1000).toFixed(1)}s — ${summary.overall.signals} সিগন্যাল, উইন রেট ${summary.overall.winRate}%`);
+   639→    return summary;
+   640→  }
+   641→
+   642→  async getLastBacktest(): Promise<BTSummary | null> {
+   643→    const s = await db.setting.findUnique({ where: { id: 'main' } });
+   644→    if (!s?.lastBacktest) return null;
+   645→    try { return JSON.parse(s.lastBacktest); } catch { return null; }
+   646→  }
+   647→
+   648→  // ---------------- logs ----------------
+   649→
+   650→  log(level: LogLine['level'], msg: string) {
+   651→    this.logs.push({ t: Date.now(), level, msg });
+   652→    if (this.logs.length > 250) this.logs.splice(0, this.logs.length - 250);
+   653→    this.io?.emit('log', this.logs[this.logs.length - 1]);
+   654→    console.log(`[qx-engine] ${msg}`);
+   655→  }
+   656→
+   657→  pushRaw(line: string) {
+   658→    this.rawLog.push(line);
+   659→    if (this.rawLog.length > 120) this.rawLog.splice(0, this.rawLog.length - 120);
+   660→  }
+   661→
+   662→  getLogs() { return this.logs.slice(-100); }
+   663→  getRawLog() { return this.rawLog.slice(-60); }
+   664→}
+   665→
