@@ -16,6 +16,8 @@ export interface EngineSettingsView {
   mode: string;
   minConfidence: number;
   pairs: string[];
+  /** demo | real — Quotex-এর দুই ফিডের দাম আলাদা */
+  accountMode?: 'demo' | 'real';
   allPairs: { symbol: string; name: string }[];
 }
 

@@ -128,6 +128,9 @@ export interface EngineStatus {
   /** none | idle | pending | ok | rejected */
   qxAuthState?: string;
   liveConnected: boolean;
+  /** demo | real — Quotex-এর দুই ফিডের দাম আলাদা, কোনটা চলছে */
+  accountMode?: 'demo' | 'real';
+  isDemo?: number;
   socketClients: number;
   serverTime: number;
   accountBalance: number | null;

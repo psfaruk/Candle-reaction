@@ -51,7 +51,7 @@ export function SignalsTab() {
   const loadHistory = useCallback(async () => {
     if (!activePair) return;
     try {
-      const r = await rpc<{ candles: Candle[] }>('get-history', { pair: activePair, limit: 200 });
+      const r = await rpc<{ candles: Candle[] }>('get-history', { pair: activePair, limit: 500 });
       setHistory(r.candles);
     } catch { /* noop */ }
   }, [activePair, rpc]);

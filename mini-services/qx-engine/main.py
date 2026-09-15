@@ -140,7 +140,7 @@ async def on_get_settings(sid, data=None):
 @sio.on("get-history")
 async def on_get_history(sid, data=None):
     d = data or {}
-    limit = min(int(d.get("limit") or 180), 400)
+    limit = min(int(d.get("limit") or 500), 1000)
     return {"candles": engine.get_history(d.get("pair") or "", limit)}
 
 
@@ -187,8 +187,18 @@ async def on_connect_token(sid, data=None):
     token = (d.get("token") or "").strip()
     if len(token) < 10:
         return {"ok": False, "msg": "টোকেন খুব ছোট — সঠিক QX (ssid) টোকেন দিন"}
+    # ঐচ্ছিক isDemo (0=রিয়েল, 1=ডেমো) — Quotex-এর দুই ফিডের দাম আলাদা,
+    # ইউজার যেটা দেখছে সেটাই আসবে (না দিলে সেভ-করা accountMode)
+    is_demo = d.get("isDemo")
     try:
-        return await engine.start_live(token)
+        if is_demo is not None:
+            is_demo = int(is_demo)
+            if is_demo not in (0, 1):
+                is_demo = None
+    except (TypeError, ValueError):
+        is_demo = None
+    try:
+        return await engine.start_live(token, is_demo=is_demo)
     except Exception as e:
         return {"ok": False, "msg": str(e)}
 

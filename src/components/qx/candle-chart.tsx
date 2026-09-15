@@ -60,6 +60,7 @@ export default function CandleChart({ pair, candles, signals, digits, height = 3
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const dataKeyRef = useRef('');
   const lastSigRef = useRef('');
+  const viewInitRef = useRef('');   // কোন পেয়ারের ওপেনিং-ভিউ সেট হয়েছে
 
   // rAF লুপের লাইভ অবস্থা (রেন্ডারের বাইরে — রি-রেন্ডারেও অ্যানিমেশন থামে না)
   const animRef = useRef({
@@ -199,6 +200,18 @@ export default function CandleChart({ pair, candles, signals, digits, height = 3
     if (dataKey !== dataKeyRef.current) {
       series.setData(candles.map(toBar));
       dataKeyRef.current = dataKey;
+      // Quotex-অ্যাপের মতো ওপেনিং ভিউ — শুধু পেয়ার বদলানোর সময় (রিফেচে
+      // ইউজারের স্ক্রল-জুম থাকবে); শেষ ~১২০ ক্যান্ডেল দেখা যাবে, বাকিটা
+      // স্ক্রল করে (গভীর হিস্ট্রি ইঞ্জিন জমিয়ে রাখে)
+      if (viewInitRef.current !== pair) {
+        viewInitRef.current = pair;
+        try {
+          chartRef.current?.timeScale().setVisibleLogicalRange({
+            from: Math.max(0, candles.length - 120),
+            to: candles.length + 3,
+          });
+        } catch { /* ডেটা কম হলে নিরাপদ */ }
+      }
       const st = animRef.current;
       const lastBar = toBar(candles[candles.length - 1]);
       st.lastDataTime = lastBar.time as number;

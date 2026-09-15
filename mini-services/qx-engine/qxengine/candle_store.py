@@ -125,7 +125,7 @@ class RunningCandle:
 
 
 class PairCandleStore:
-    def __init__(self, pair: str, max_keep: int = 700):
+    def __init__(self, pair: str, max_keep: int = 1000):
         self.pair = pair
         self.candles = []
         self.running = None

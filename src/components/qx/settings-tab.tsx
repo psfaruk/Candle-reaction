@@ -24,11 +24,14 @@ export function SettingsTab() {
   const [minConf, setMinConf] = useState(70);
   const [saving, setSaving] = useState(false);
   const [showRaw, setShowRaw] = useState(false);
+  const [accountMode, setAccountMode] = useState<'demo' | 'real'>('demo');
 
   useEffect(() => {
     if (settings) {
       setSelPairs(settings.pairs);
       setMinConf(settings.minConfidence);
+      if (settings.accountMode === 'real') setAccountMode('real');
+      else setAccountMode('demo');
     }
   }, [settings]);
 
@@ -45,7 +48,10 @@ export function SettingsTab() {
     }
     setConnecting(true);
     try {
-      const r = await rpc<{ ok: boolean; msg: string }>('connect-token', { token: token.trim() });
+      const r = await rpc<{ ok: boolean; msg: string }>('connect-token', {
+        token: token.trim(),
+        isDemo: accountMode === 'real' ? 0 : 1,
+      });
       toast({ title: r.ok ? 'সংযোগ সফল' : 'সংযোগ ব্যর্থ', description: r.msg, variant: r.ok ? 'default' : 'destructive' });
       if (r.ok) setToken('');
     } catch (e: any) {
@@ -60,6 +66,20 @@ export function SettingsTab() {
       const r = await rpc<{ ok: boolean; msg: string }>('disconnect-live');
       toast({ title: 'লাইভ বন্ধ', description: r.msg });
     } catch { /* noop */ }
+  };
+
+  const switchAccount = async (mode: 'demo' | 'real') => {
+    if (mode === accountMode) return;
+    setAccountMode(mode);
+    try {
+      const r = await rpc<{ ok: boolean; msg: string }>('save-settings', { accountMode: mode });
+      toast({
+        title: mode === 'real' ? 'রিয়েল অ্যাকাউন্ট ফিড' : 'ডেমো অ্যাকাউন্ট ফিড',
+        description: 'Quotex-এর ডেমো ও রিয়েল ফিডের দাম আলাদা হয় — লাইভ সংযোগ থাকলে নতুন ফিডে পুনঃসংযোগ হচ্ছে',
+      });
+    } catch (e: any) {
+      toast({ title: 'ত্রুটি', description: String(e?.message ?? e), variant: 'destructive' });
+    }
   };
 
   const save = async () => {
@@ -123,7 +143,7 @@ export function SettingsTab() {
                 } animate-pulse`} />
                 {status?.mode === 'LIVE'
                   ? status?.feedProvider === 'quotex'
-                    ? 'লাইভ Quotex টিক ডেটা চলছে'
+                    ? `লাইভ Quotex টিক (${status?.accountMode === 'real' ? 'রিয়েল অ্যাকাউন্ট' : 'ডেমো অ্যাকাউন্ট'})`
                     : 'রিয়েল মার্কেট ডেটা চলছে (টোকেন দিলে Quotex টিকে সুইচ হবে)'
                   : 'Quotex সংযোগের অপেক্ষায়…'}
               </span>
@@ -161,6 +181,33 @@ export function SettingsTab() {
                     ইঞ্জিন পুনঃসংযোগ
                   </Button>
                 )}
+              </div>
+              {/* অ্যাকাউন্ট-টাইপ — Quotex অ্যাপে যেটা দেখছেন সেটাই বাছুন */}
+              <div className="flex flex-wrap items-center gap-2 rounded-md border border-zinc-800 bg-zinc-800/30 px-3 py-2.5">
+                <span className="text-xs font-medium text-zinc-300">অ্যাকাউন্ট টাইপ:</span>
+                <button
+                  onClick={() => switchAccount('demo')}
+                  className={`rounded-full border px-3 py-1 text-xs font-medium transition-colors ${
+                    accountMode === 'demo'
+                      ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-400'
+                      : 'border-zinc-700 bg-zinc-800/50 text-zinc-400 hover:border-zinc-600'
+                  }`}
+                >
+                  🎮 ডেমো
+                </button>
+                <button
+                  onClick={() => switchAccount('real')}
+                  className={`rounded-full border px-3 py-1 text-xs font-medium transition-colors ${
+                    accountMode === 'real'
+                      ? 'border-amber-500/50 bg-amber-500/15 text-amber-400'
+                      : 'border-zinc-700 bg-zinc-800/50 text-zinc-400 hover:border-zinc-600'
+                  }`}
+                >
+                  💰 রিয়েল
+                </button>
+                <span className="text-[11px] text-zinc-500">
+                  Quotex অ্যাপ/সাইটে যে অ্যাকাউন্টের চার্ট দেখছেন সেটাই বাছুন — ডেমো ও রিয়েলের দাম আলাদা হয়, মিলতে হলে সঠিক ফিড লাগবে
+                </span>
               </div>
               {!connected && (
                 <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-200/90">

@@ -112,7 +112,17 @@ class DB:
                      "EURUSD,USDJPY,AUDUSD,GBPUSD,EURJPY,GBPJPY,USDCAD,USDCHF"))
                 self.conn.commit()
                 row = self.conn.execute('SELECT * FROM "Setting" WHERE id=?', ("main",)).fetchone()
-            return dict(row)
+            d = dict(row)
+            # মাইগ্রেশন: accountMode (demo|real) — Quotex-এর দুই ফিডের দাম আলাদা,
+            # ইউজার তাই অ্যাকাউন্ট-টাইপ বাছাই করতে পারবে
+            if "accountMode" not in d:
+                try:
+                    self.conn.execute('ALTER TABLE "Setting" ADD COLUMN "accountMode" TEXT NOT NULL DEFAULT \'demo\'')
+                    self.conn.commit()
+                    d["accountMode"] = "demo"
+                except sqlite3.OperationalError:
+                    pass
+            return d
 
     def update_setting(self, **fields):
         if not fields:
@@ -169,6 +179,26 @@ class DB:
             self.conn.commit()
             cur.close()
 
+    def upsert_candles(self, candles):
+        """নতুন Quotex-পেলোড পুরনো মান বদলে দেবে (জেনারেশন-রোটেশন সেলফ-হিলিং)।"""
+        if not candles:
+            return
+        with self.lock:
+            cur = self.conn.cursor()
+            for c in candles:
+                cur.execute(
+                    'INSERT OR REPLACE INTO "Candle" '
+                    '("id","pair","ts","open","high","low","close","ticks","upTicks","downTicks",'
+                    '"lateFlip","lateMomentum","flipCount","source") '
+                    'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (f'{c["pair"]}:{c["ts"]}', c["pair"], int(c["ts"]),
+                     c["open"], c["high"], c["low"], c["close"],
+                     c.get("ticks", 0), c.get("upTicks", 0), c.get("downTicks", 0),
+                     c.get("lateFlip", 0), c.get("lateMomentum", 0.0),
+                     c.get("flipCount", 0), c.get("source", "LIVE")))
+            self.conn.commit()
+            cur.close()
+
     def purge_simulation_data(self):
         """সিমুলেশন চিরতরে বিদায় — wipe all legacy fake + stale rows."""
         with self.lock:
@@ -179,6 +209,17 @@ class DB:
                 self.conn.commit()
             except sqlite3.Error as e:
                 print(f"[db] purge warning: {e}")
+            finally:
+                cur.close()
+
+    def delete_pair_candles(self, pair: str):
+        """Quotex হিস্ট্রি এলে ওই পেয়ারের সব পুরনো (Yahoo/মিশ্র) ক্যান্ডেল মুছে
+        ১০০% Quotex ডেটা বসানো হয় — INSERT OR IGNORE নয়, পরিষ্কার রিপ্লেস।"""
+        with self.lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute('DELETE FROM "Candle" WHERE "pair"=?', (pair,))
+                self.conn.commit()
             finally:
                 cur.close()
 

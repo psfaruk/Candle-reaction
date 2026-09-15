@@ -52,6 +52,12 @@ class MarketEngine:
         self._tick_dirty = set()     # pair-গুলো নতুন টিক পেয়েছে (১০Hz ফ্লাশ হবে)
         self.account = {"balance": None, "currency": None, "login": None}
         self.yahoo = YahooFeed(self._on_yahoo_bars, self.log)
+        # Quotex-নির্দিষ্ট স্টেট
+        self.account_mode = "demo"            # demo | real — Quotex ফিড-নির্বাচন
+        self._qx_purged = set()               # যেসব পেয়ারের Yahoo-ডেটা মুছে Quotex বসানো হয়েছে
+        self._page_empty = {}                 # pair → টানা খালি পেজ-সংখ্যা (হিস্ট্রি শেষ ধরার জন্য)
+        self._page_wait = {}                   # pair → শেষ পেজ-রিকোয়েস্ট epoch-ms
+        self._page_done = set()                # পেয়ারের ডিপ-হিস্ট্রি সম্পূর্ণ
 
     # ---------------- lifecycle ----------------
 
@@ -82,6 +88,10 @@ class MarketEngine:
         env_token = ("" + (_getenv("QX_TOKEN") or "")).strip()
         self.token_source = "env" if env_token else "db"
         token = env_token or s.get("qxToken") or None
+        # অ্যাকাউন্ট-টাইপ: demo | real (Quotex-এর দুই ফিডের দাম আলাদা —
+        # ইউজার যেটা দেখছে সেটাই বাছাই)
+        self.account_mode = "real" if str(s.get("accountMode") or "demo").lower() == "real" else "demo"
+        self._qx_started_at = time.time()   # ফিড-রোল শিডিউলারের ঘড়ি
 
         self.log("info", f"ইঞ্জিন চালু (Python) — {len(self.active_pairs)}টি পেয়ার, রিয়েল-ডেটা-অনলি মোড")
 
@@ -95,6 +105,8 @@ class MarketEngine:
         self._tasks.append(asyncio.create_task(self._broadcast_loop()))
         self._tasks.append(asyncio.create_task(self._tick_broadcast_loop()))
         self._tasks.append(asyncio.create_task(self._yahoo_loop()))
+        self._tasks.append(asyncio.create_task(self._deep_history_loop()))
+        self._tasks.append(asyncio.create_task(self._canary_loop()))
 
         if token:
             self._tasks.append(asyncio.create_task(self._auto_connect(token)))
@@ -124,7 +136,7 @@ class MarketEngine:
             if candles:
                 self.db.insert_candles(candles)
                 self.log("info", f"[{sym}] Yahoo রিয়েল মার্কেট হিস্ট্রি: {len(candles)}টি ১-মিনিট ক্যান্ডেল")
-        candles = self.db.load_candles(sym, 700)
+        candles = self.db.load_candles(sym, 1000)
         store = self.stores.get(sym)
         if store is None:
             store = self.stores[sym] = PairCandleStore(sym)
@@ -152,21 +164,180 @@ class MarketEngine:
                                      if owner == "quotex" and self._qx_fresh(p)}
             await asyncio.sleep(5)
 
+    # ---------------- Quotex ডিপ-হিস্ট্রি পেজিং ----------------
+
+    DEEP_TARGET = 720      # প্রতি পেয়ারে লক্ষ্য-ক্যান্ডেল (~১২ ঘণ্টা)
+    PAGE_PAUSE_MS = 1500   # পেয়ার প্রতি পেজ-রিকোয়েস্টের ব্যবধান
+
+    async def _deep_history_loop(self):
+        """history/load-এর `time` প্যারামিটার দিয়ে পেছনে পেছনে ক্যান্ডেল জমানো।
+
+        প্রতি রিকোয়েস্টে `time`-এর মিনিট থেকে ~১২টি ক্যান্ডেল আসে; প্রথম
+        সাবস্ক্রিপশনে history/list/v2 ~২০০টি দেয়। লক্ষ্য ৭২০ — চার্ট খুললেই
+        Quotex-অ্যাপের মতো গভীর হিস্ট্রি, ব্যাকটেস্ট/সিগন্যালও সমৃদ্ধ।"""
+        while True:
+            try:
+                await asyncio.sleep(2)
+                qx = self.qx
+                if (qx is None or not qx.connected or qx.auth_state != "ok"):
+                    continue
+                now_ms = int(time.time() * 1000)
+                for sym in list(self.active_pairs):
+                    if sym not in self._qx_purged or sym in self._page_done:
+                        continue
+                    store = self.stores.get(sym)
+                    if store is None:
+                        continue
+                    if len(store.candles) >= self.DEEP_TARGET:
+                        self._page_done.add(sym)
+                        self.log("info", f"[{sym}] ডিপ-হিস্ট্রি সম্পূর্ণ ({len(store.candles)} ক্যান্ডেল)")
+                        continue
+                    if self._page_empty.get(sym, 0) >= 3:
+                        self._page_done.add(sym)   # পেয়ারের সব হিস্ট্রি শেষ
+                        continue
+                    last = self._page_wait.get(sym, 0)
+                    if now_ms - last < self.PAGE_PAUSE_MS:
+                        continue
+                    oldest = store.candles[0]["ts"] if store.candles else int(time.time() * 1000)
+                    # এক পেজ আগের শেষে — ১২-মিনিট জানালা, মিনিট-সারিবদ্ধ
+                    end_s = (oldest - 12 * 60_000) // 1000
+                    self._page_wait[sym] = now_ms
+                    try:
+                        await qx.request_history(sym, end_s)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.35)   # পেয়ার-মধ্যবর্তী ব্রেথ
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.log("warn", f"ডিপ-হিস্ট্রি লুপ ত্রুটি: {e}")
+
+    # ---------------- Quotex ফিড-ক্যানারি (জেনারেশন-রোটেশন প্রতিরোধ) ----------------
+
+    # ⭐ Quotex OTC ফিড পর্যায়ক্রমে রোটেট হয় — পুরনো সংযোগ পুরনো জেনারেশনে আটকে
+    # থাকে, তখন অ্যাপের দাম ইউজারের Quotex-অ্যাপের সাথে মিলতে থাকে না (কয়েক পিপ
+    # এড়ে যায়)। প্রমাণিত: ৭ পেয়ারে হুবহু মিল + ১ পেয়ারে ৩০ মিনিট ডাইভারজেন্স।
+    # প্রতিরোধ: ① প্রতি ৩ মিনিটে একটি ফ্রেশ ক্যানারি-সংযোগ হিস্ট্রি আনে —
+    # সাথে নিজের ক্যান্ডেল মেলায়; না মিললে মূল সংযোগ রোল হয় ② ২৫ মিনিট পরপর
+    # প্রোঅ্যাক্টিভ রোল (রোটেশন ধরা না পড়লেও বাউন্ডেড)।
+    CANARY_INTERVAL_S = 180
+    CANARY_DUR_S = 14
+    FEED_RECONNECT_S = 1500
+
+    async def _canary_loop(self):
+        while True:
+            try:
+                await asyncio.sleep(self.CANARY_INTERVAL_S)
+                if not (self.qx_token and self._qx_fresh_any()):
+                    continue
+                if time.time() - self._qx_started_at > self.FEED_RECONNECT_S:
+                    self.log("info", "Quotex ফিড ২৫ মিনিট পুরনো — OTC জেনারেশন-রোটেশনের "
+                                    "বিরুদ্ধে প্রোঅ্যাক্টিভ রোল (নতুন সংযোগ = ইউজারের অ্যাপের মতো ফিড)")
+                    await self._reconnect_live()
+                    continue
+                await self._canary_check()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.log("warn", f"ক্যানারি লুপ ত্রুটি: {e}")
+
+    async def _canary_check(self):
+        """ফ্রেশ সংযোগ থেকে ক্যানোনিক্যাল হিস্ট্রি + লাইভ টিক এনে নিজের সাথে মেলাই।
+
+        দুই স্তরের যাচাই:
+        ① ক্যান্ডেল: ক্যানারি খোলার আগের টিক-নির্মিত বন্ধ-ক্যান্ডেলের স্ন্যাপশট বনাম
+           ক্যানারির হিস্ট্রি (ক্রসটক-রেফাইন স্টোর বদলে দেয় বলে আগে স্ন্যাপ নিই)
+        ② লাইভ টিক: চলমান দাম বনাম ক্যানারির শেষ লাইভ টিক — ক্রসটকের ওপর
+           নির্ভরশীল নয়, তাই সবচেয়ে নির্ভরযোগ্য
+        যেকোনোটা ডাইভার্ট করলে মূল সংযোগ রোল হয়।"""
+        # ক্যানারির আগের স্ন্যাপশট (ইঞ্জিনের নিজের লাইভ-টিক থেকে বানানো ক্যান্ডেল)
+        pre = {}
+        for sym in self.active_pairs:
+            st = self.stores.get(sym)
+            if st is not None and st.candles:
+                pre[sym] = {c["ts"]: c for c in st.candles[-3:]}
+        ev = _CanaryEvents()
+        c = QuotexClient(self.qx_token, ev, is_demo=0 if self.account_mode == "real" else 1)
+        c.set_pairs(self.active_pairs)
+        await c.start()
+        await asyncio.sleep(self.CANARY_DUR_S)
+        try:
+            await c.close()
+        except Exception:
+            pass
+        diverged = []
+        checked = 0
+        for sym in self.active_pairs:
+            st = self.stores.get(sym)
+            if st is None:
+                continue
+            pdef = get_pair_def(sym)
+            pip = pdef["pip"]
+            tol = pip * 2
+            # ① ক্যান্ডেল-স্ন্যাপশট যাচাই
+            bad = good = 0
+            snap = pre.get(sym, {})
+            for ts, can in ev.candles.get(sym, {}).items():
+                mine = snap.get(ts)
+                if mine is None:
+                    continue
+                checked += 1
+                if (abs(mine["close"] - can["c"]) > tol
+                        or abs(mine["open"] - can["o"]) > tol):
+                    bad += 1
+                else:
+                    good += 1
+            # ② লাইভ-টিক যাচাই — ক্রসটক-ইমিউন
+            live_div = False
+            can_last = ev.last_ticks.get(sym)
+            if st.running is not None and can_last:
+                if abs(st.running.last - can_last) > pip * 2.5:
+                    live_div = True
+            if live_div or (bad >= 2 and good == 0):
+                diverged.append(sym)
+        if checked == 0 and not any(ev.last_ticks.values()):
+            return   # ক্যানারি ডেটা পায়নি — পরের বার আবার
+        if diverged:
+            self.log("warn", f"ফিড-ডাইভারজেন্স ({', '.join(diverged)}) — Quotex OTC জেনারেশন "
+                            "রোটেট হয়েছে; নতুন সংযোগে রোল করা হচ্ছে যেন Quotex-অ্যাপের "
+                            "সাথে ১০০% মিল থাকে")
+            await self._reconnect_live()
+
+    async def _reconnect_live(self):
+        tok = self.qx_token
+        if not tok:
+            return
+        await self._stop_live_client()
+        self._qx_started_at = time.time()
+        self._tasks.append(asyncio.create_task(self._auto_connect(tok)))
+
     def _qx_fresh(self, pair: str) -> bool:
         return (self.qx is not None and self.qx.connected and self.qx.auth_state == "ok"
                 and int(time.time() * 1000) - self.last_live_tick_at < 15_000)
 
     # ---------------- Quotex live ----------------
 
-    async def start_live(self, token: str):
+    async def start_live(self, token: str, is_demo: int = None):
         await self._stop_live_client()
         self.qx_token = token
         try:
             self.db.update_setting(qxToken=token)
         except Exception:
             pass
-        self.qx = QuotexClient(token, _EngineQuotexEvents(self))
+        if is_demo not in (0, 1):
+            is_demo = 0 if self.account_mode == "real" else 1
+        else:
+            # স্পষ্ট isDemo দিলে সেটিংসও সেটাই হোক (UI-তে দেখাবে)
+            mode = "real" if is_demo == 0 else "demo"
+            if mode != self.account_mode:
+                self.account_mode = mode
+                try:
+                    self.db.update_setting(accountMode=mode)
+                except Exception:
+                    pass
+        self.qx = QuotexClient(token, _EngineQuotexEvents(self), is_demo=is_demo)
         self.qx.set_pairs(self.active_pairs)
+        self._qx_started_at = time.time()
         await self.qx.start()
 
         t0 = time.monotonic()
@@ -213,6 +384,10 @@ class MarketEngine:
         for p in list(self.feed_owner):
             if self.feed_owner[p] == "quotex":
                 self.feed_owner[p] = "yahoo"
+        # Quotex বিচ্ছিন্ন → পরে পুনঃসংযোগে নতুন করে পার্জ+রিপ্লেস হবে
+        self._qx_purged.clear()
+        self._page_empty.clear()
+        self._page_done.clear()
 
     def on_quotex_tick(self, pair: str, price: float, t: int):
         store = self.stores.get(pair)
@@ -227,29 +402,63 @@ class MarketEngine:
         self._tick_dirty.add(pair)   # ফাস্ট-পাথ: ১০Hz-এ ব্রাউজারে যাবে
 
     def on_quotex_candles(self, pair: str, candles):
+        """Quotex-এর নিজস্ব ১-মিনিট ক্যান্ডেল — চার্টের একমাত্র সত্য এখন।
+
+        ⭐ ১০০% Quotex-ম্যাচ গ্যারান্টি: প্রথমবার এলে ওই পেয়ারের সব পুরনো
+        (Yahoo/মিশ্র) ক্যান্ডেল DB + স্টোর থেকে মুছে দিয়ে শুধুই Quotex-এর
+        হিস্ট্রি বসানো হয় (আগে পুরনোগুলো থেকে যেত — OTC ফিডের সাথে কখনোই
+        মিলত না, আর INSERT OR IGNORE থাকায় ভুল দাম সঠিকটাকে ব্লকও করত)।
+        """
         store = self.stores.get(pair)
         if store is None or not candles:
             return
-        self.log("info", f"[{pair}] Quotex থেকে {len(candles)}টি হিস্টোরিক্যাল ক্যান্ডেল পাওয়া গেছে")
+        self.feed_owner[pair] = "quotex"
         mapped = []
         for c in candles:
             if c["o"] is None or c["c"] is None:
                 continue
+            tk = int(c.get("tk") or 0)
             mapped.append(make_candle(pair, (c["t"] // MINUTE) * MINUTE, c["o"],
-                                       max(c["h"], c["o"], c["c"]), min(c["l"], c["o"], c["c"]),
-                                       c["c"], source="LIVE"))
-        try:
-            self.db.insert_candles(mapped)
-        except Exception:
-            pass
-        live_from = mapped[0]["ts"] if mapped else 0
-        seen = {x["ts"] for x in store.candles}
-        keep = [c for c in store.candles if c["ts"] < live_from or c.get("_qx") is True]
+                                      max(c["h"], c["o"], c["c"]), min(c["l"], c["o"], c["c"]),
+                                      c["c"], ticks=tk, source="QX"))
+        if not mapped:
+            return
+        if pair not in self._qx_purged:
+            # ফুল-রিপ্লেস: DB-তে পেয়ারের সব পুরনো ক্যান্ডেল মুছে Quotex-সেট বসাই
+            try:
+                self.db.delete_pair_candles(pair)
+            except Exception:
+                pass
+            self._qx_purged.add(pair)
+            self._page_empty[pair] = 0
+            self.log("info", f"[{pair}] Quotex হিস্ট্রি বসছে — পুরনো (Yahoo/মিশ্র) "
+                            "ক্যান্ডেল সরিয়ে ১০০% Quotex ডেটা")
+            store.candles = []   # রানিং-ক্যান্ডেল অক্ষত — সেটাও Quotex-টিক থেকেই চলছে
+        # মার্জ: নতুন Quotex-পেলোডই সর্বদা বিজয়ী — জেনারেশন-রোটেশন বা রিপোলের
+        # পরে পুরনো ভুল মান নতুন ক্যানোনিক্যাল মানে বদলে যাবে (সেলফ-হিলিং)
+        by_ts = {c["ts"]: c for c in store.candles}
+        new, upd = 0, 0
         for c in mapped:
-            if c["ts"] not in seen:
-                keep.append(c)
-        keep.sort(key=lambda x: x["ts"])
-        store.candles = keep[-store.max_keep:]
+            old = by_ts.get(c["ts"])
+            if old is None:
+                by_ts[c["ts"]] = c
+                new += 1
+            elif old != c:
+                by_ts[c["ts"]] = c
+                upd += 1
+        if new or upd:
+            store.candles = sorted(by_ts.values(), key=lambda x: x["ts"])[-store.max_keep:]
+            try:
+                self.db.upsert_candles([c for c in mapped if by_ts.get(c["ts"]) is c])
+            except Exception:
+                pass
+            self.log("info", f"[{pair}] Quotex থেকে {new}টি নতুন হিস্টোরিক্যাল ক্যান্ডেল "
+                            f"(+{upd} রিফাইন) — মোট {len(store.candles)}")
+            self._tick_dirty.add(pair)
+            self.emit("market", self.snapshot())
+        # ডিপ-হিস্ট্রি পেজিং-এর খালি-পেজ কাউন্টার
+        if pair in self._page_empty and not new and not upd:
+            self._page_empty[pair] = self._page_empty.get(pair, 0) + 1
 
     # ---------------- Yahoo feed ----------------
 
@@ -478,6 +687,8 @@ class MarketEngine:
             "feedProvider": feed,
             "qxAuthState": qx_state,
             "liveConnected": feed == "quotex",
+            "accountMode": self.account_mode,
+            "isDemo": 0 if self.account_mode == "real" else 1,
             "socketClients": self.socket_clients,
             "serverTime": int(time.time() * 1000),
             "accountBalance": self.account["balance"],
@@ -486,7 +697,7 @@ class MarketEngine:
             "activePairs": list(self.active_pairs),
             "minConfidence": self.min_confidence,
             "uptimeSec": int((time.time() * 1000 - self.started_at) / 1000),
-            "historyMinutes": 2880,
+            "historyMinutes": 720,
         }
 
     def snapshot(self) -> dict:
@@ -552,7 +763,7 @@ class MarketEngine:
             "pendingSignals": list(self.pending.values()),
         }
 
-    def get_history(self, pair: str, limit: int = 180):
+    def get_history(self, pair: str, limit: int = 500):
         store = self.stores.get(pair)
         if store is None:
             return []
@@ -631,6 +842,12 @@ class MarketEngine:
                 self.min_confidence = max(50, min(95, js_round(float(patch["minConfidence"]))))
             except (TypeError, ValueError):
                 pass
+        acct = str(patch.get("accountMode") or "").strip().lower()
+        acct_changed = acct in ("demo", "real") and acct != self.account_mode
+        if acct_changed:
+            self.account_mode = acct
+            self.log("info", f"অ্যাকাউন্ট-টাইপ: {'রিয়েল' if acct == 'real' else 'ডেমো'} — "
+                            "Quotex ফিড পুনঃসংযোগ হচ্ছে")
         new_pairs = patch.get("pairs")
         if new_pairs:
             valid = [p for p in new_pairs if any(d["symbol"] == p for d in ALL_PAIRS)]
@@ -659,9 +876,13 @@ class MarketEngine:
         try:
             self.db.update_setting(minConfidence=self.min_confidence,
                                    mode="live",
+                                   accountMode=self.account_mode,
                                    pairs=",".join(self.active_pairs))
         except Exception:
             pass
+        # অ্যাকাউন্ট-টাইপ বদলালে লাইভ ফিড নতুন isDemo-তে পুনঃসংযোগ
+        if acct_changed and self.qx_token:
+            self._tasks.append(asyncio.create_task(self._auto_connect(self.qx_token)))
         self.emit("status", self.status_snapshot())
         return {"ok": True, "msg": "সেটিংস সংরক্ষিত"}
 
@@ -678,6 +899,7 @@ class MarketEngine:
             "mode": "live",
             "minConfidence": self.min_confidence,
             "pairs": list(self.active_pairs),
+            "accountMode": self.account_mode,
             "allPairs": [{"symbol": p["symbol"], "name": p["name"]} for p in ALL_PAIRS],
         }
 
@@ -758,6 +980,24 @@ class MarketEngine:
 def _getenv(name):
     import os
     return os.environ.get(name)
+
+
+class _CanaryEvents(QuotexEvents):
+    """ক্যানারি-সংযোগের ক্যান্ডেল + লাইভ-টিক সংগ্রাহক (ফিড-জেনারেশন যাচাই)।"""
+
+    def __init__(self):
+        self.candles = {}    # pair → {ts_ms: {o,h,l,c}}
+        self.last_ticks = {}  # pair → শেষ লাইভ টিকের দাম
+
+    def on_candles(self, pair, candles):
+        by_ts = self.candles.setdefault(pair, {})
+        for c in candles:
+            if c.get("o") is None or c.get("c") is None:
+                continue
+            by_ts[(c["t"] // 60000) * 60000] = c
+
+    def on_tick(self, pair, price, t):
+        self.last_ticks[pair] = price
 
 
 class _EngineQuotexEvents(QuotexEvents):

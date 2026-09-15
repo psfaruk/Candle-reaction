@@ -44,7 +44,7 @@ function StatusBadges() {
       }`}>
         {status?.mode === 'LIVE'
           ? status?.feedProvider === 'quotex'
-            ? '● লাইভ Quotex (টিক)'
+            ? `● লাইভ Quotex (টিক, ${status?.accountMode === 'real' ? 'রিয়েল' : 'ডেমো'})`
             : '● রিয়েল মার্কেট ডেটা'
           : '● সংযোগ হচ্ছে…'}
       </span>

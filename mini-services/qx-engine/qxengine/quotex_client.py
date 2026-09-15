@@ -168,8 +168,12 @@ class QuotexClient:
       • সব সেন্ড threading.Lock-কৃত _t_send দিয়ে (যেকোনো থ্রেড থেকে নিরাপদ)
     """
 
-    def __init__(self, token: str, ev: QuotexEvents, pairs=None):
+    def __init__(self, token: str, ev: QuotexEvents, pairs=None, is_demo: int = None):
         self.auth = parse_qx_token(token)
+        # অ্যাকাউন্ট-টাইপ সেটিং (ডেমো/রিয়েল) — Quotex-এর দুই ফিডের দাম আলাদা
+        # হতে পারে; ইউজার যেটা দেখছে সেটাই বাছাই করবে। ডিফল্ট আগের মতো ডেমো।
+        if is_demo in (0, 1):
+            self.auth = (self.auth[0], int(is_demo))
         self.ev = ev
         self.closed = False
         self.auth_state = "idle"          # idle | pending | ok | rejected
@@ -705,12 +709,19 @@ class QuotexClient:
                 pass
             return
         if evt == "history/list/v2":
-            # এটা RAW টিক-হিস্টোরি: {"history": [[ts, price, dir], ...]} —
-            # ক্যান্ডেল নয়! (ভুল করে ক্যান্ডেল ভাবলে close=direction 0/1
-            # ঢুকে যায়।) আসল 1m ক্যান্ডেল history/load থেকেই আসে।
+            # ⭐ Quotex-এর আসল ১-মিনিট ক্যান্ডেল-হিস্ট্রি এখানেই আসে:
+            #   {"asset": "EURUSD_otc", "period": 60,
+            #    "history": [[ts, price, dir], …]   ← র-টিক (ক্যান্ডেল নয়)
+            #    "candles": [[time, open, close, high, low, ticks, realTime], …] ← আসল ক্যান্ডেল (~২০০টি)}
+            # প্রথম history/load-এ প্রতি পেয়ারে একবার এই বড় প্যাকেট আসে।
+            # (.history-র টিকগুলো ক্যান্ডেল নয় — সেগুলো স্কিপ; .candles-ই ব্যবহার।)
+            if isinstance(data, dict) and isinstance(data.get("candles"), list) and data["candles"]:
+                self._handle_history_payload(data)
             return
         if evt in ("history/load", "success-instruments-candles",
                    "instruments-candles", "chart_notification/get"):
+            # history/load ইভেন্ট (ছোট, ~১২ dict-ক্যান্ডেল) — ডিপ-হিস্ট্রি
+            # পেজিং-এর রেসপন্সও এই ফরম্যাটেই আসে (time প্যারামিটার দিয়ে পেজ-ব্যাক)।
             self._handle_history_payload(data)
             return
 
@@ -776,19 +787,33 @@ class QuotexClient:
         pair = self.pair_by_symbol.get(asset_raw) if asset_raw else None
 
         raw_candles = None
-        hist = data.get("history", data.get("candles", data.get("data")))
-        if isinstance(hist, list):
-            raw_candles = hist
-        elif isinstance(hist, dict):
-            if isinstance(hist.get("candles"), list):
-                raw_candles = hist["candles"]
-            elif isinstance(hist.get("data"), dict) and isinstance(hist["data"].get("candles"), list):
-                raw_candles = hist["data"]["candles"]
-            else:
-                for v in hist.values():
-                    if isinstance(v, dict) and isinstance(v.get("candles"), list):
-                        raw_candles = v["candles"]
-                        break
+        # ⭐ অগ্রাধিকার-ক্রম: "candles" (history/list/v2 — আসল ক্যান্ডেল) →
+        # "data" (history/load — dict-ক্যান্ডেল) → "history" (শুধু সত্যিকারের
+        # ক্যান্ডেল-সারি হলে; [ts, price, dir] র-টিক কখনোই নয়)
+        if isinstance(data.get("candles"), list):
+            raw_candles = data["candles"]
+        elif isinstance(data.get("data"), list):
+            raw_candles = data["data"]
+        elif isinstance(data.get("history"), list):
+            rows = data["history"]
+            # ক্যান্ডেল-সারি = ≥৫ এলিমেন্ট; র-টিক = ৩ এলিমেন্ট → স্কিপ
+            if rows and isinstance(rows[0], list) and len(rows[0]) >= 5:
+                raw_candles = rows
+        if raw_candles is None:
+            # নেস্টেড শেপের ফলব্যাক (আগের হান্টার)
+            hist = data.get("candles", data.get("history", data.get("data")))
+            if isinstance(hist, list):
+                raw_candles = hist
+            elif isinstance(hist, dict):
+                if isinstance(hist.get("candles"), list):
+                    raw_candles = hist["candles"]
+                elif isinstance(hist.get("data"), dict) and isinstance(hist["data"].get("candles"), list):
+                    raw_candles = hist["data"]["candles"]
+                else:
+                    for v in hist.values():
+                        if isinstance(v, dict) and isinstance(v.get("candles"), list):
+                            raw_candles = v["candles"]
+                            break
         if not raw_candles:
             return
 
@@ -796,6 +821,7 @@ class QuotexClient:
         candles = []
         for rc in raw_candles:
             t = o = h = l = c = None
+            tk = 0
             if isinstance(rc, list):
                 try:
                     t = float(rc[0])
@@ -804,6 +830,8 @@ class QuotexClient:
                         c = float(rc[2])
                         h = float(rc[3])
                         l = float(rc[4])
+                        if len(rc) >= 6 and isinstance(rc[5], (int, float)):
+                            tk = int(rc[5])       # Quotex নিজের টিক-কাউন্ট
                     elif len(rc) >= 3:
                         c = float(rc[2])
                         h, l = max(o, c), min(o, c)
@@ -821,8 +849,12 @@ class QuotexClient:
                 h = _num("high", "h")
                 l = _num("low", "l")
                 c = _num("close", "c")
+                if isinstance(rc.get("ticks"), (int, float)):
+                    tk = int(rc["ticks"])          # history/load dict-ফরম্যাটের টিক-কাউন্ট
             if t is None or not math.isfinite(t):
                 continue
+            if c is not None and (c <= 0 or c > 1e9):
+                continue   # জাবার্ব গার্ড (dir=0/1-এর মতো ভুল পার্স)
             t_ms = int(t) if t > 1e12 else int(t * 1000)
             if None in (o, h, l, c):
                 if o is not None and c is not None:
@@ -831,6 +863,7 @@ class QuotexClient:
                     continue
             candles.append({
                 "t": t_ms, "o": o, "h": max(h, o, c), "l": min(l, o, c), "c": c,
+                "tk": tk,
             })
         if candles and pair:
             candles.sort(key=lambda x: x["t"])
@@ -874,6 +907,19 @@ class QuotexClient:
                 return
             await self._send(s)
             await asyncio.sleep(0.12)
+
+    async def request_history(self, base_symbol: str, end_time_s: int):
+        """ডিপ-হিস্ট্রি পেজিং — `time` প্যারামিটার দিয়ে পেছনের ক্যান্ডেল।
+
+        প্রতি রিকোয়েস্টে `time`-এর মিনিট থেকে ~১২টি ক্যান্ডেল আসে
+        (history/load ইভেন্ট, dict-ফরম্যাট)। ইঞ্জিন এটা বারবার ডেকে
+        পুরনো ক্যান্ডেল জমায়।"""
+        p = self.pair_by_symbol.get(base_symbol.upper())
+        qasset = f"{base_symbol.upper()}_otc" if p else base_symbol
+        frame = "42" + json.dumps(["history/load", {
+            "asset": qasset, "index": 0, "time": int(end_time_s),
+            "offset": 720, "period": 60}], separators=(",", ":"))
+        await self._send(frame)
 
     def _emit_tick(self, pair, price, t_ms):
         self.got_ticks = True
