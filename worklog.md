@@ -171,3 +171,28 @@ Stage Summary:
 - আসল Quotex এন্ডপয়েন্ট+প্রোটোকল এখন সঠিক — বৈধ টোকেন দিলে লাইভ টিক/ক্যান্ডেল/ব্যালেন্স কয়েক সেকেন্ডেই আসবে; টোকেন মেয়াদ শেষ হলে স্পষ্ট বার্তা
 - ইঞ্জিন এখন সত্যিকারের অমর: boot-retry + listener self-heal + port-failover (kill -9 প্রমাণিত) + Railway supervisor
 - User action: Railway Redeploy (নতুন কমিট 4646140) → নতুন টোকেন নিন (Settings ট্যাবের নতুন ① Network→WS→authorization লাইন নির্দেশনা অনুসরণ করে) → পেস্ট করুন
+
+---
+Task ID: 9
+Agent: main (Super Z)
+Task: "Data আসে না" চিরকালীন সমাধান — Python রিয়েল-ডেটা ইঞ্জিন, সিমুলেশন চিরতরে বিদায়, রিয়েল ওয়েবসাইট (user request)
+
+Work Log:
+- Diagnosed deployed app: /qx-health on Railway returns Next 404 → deployed service ran ONLY Next.js on public port, engine never reachable → every token paste hit dead endpoint
+- Probed Quotex live from Python: ws2.qxbroker.com EIO=3 protocol works (handshake, instruments/list 92 assets); user token KNFyw…rtpH REJECTED on both isDemo 0/1 → EXPIRED; unauth data impossible (server kills socket); cross-checked with ChipaDevTeam/QuotexAPI source — protocol match confirmed
+- REWROTE engine in Python (user's requirement): mini-services/qx-engine = pure Python package
+  - quotex_client.py: session-token authorization (paced 1.2s), isDemo auto-flip, paced subscriptions (120ms), quote batches + binary history parsing, heartbeat, reconnect backoff, no-hammer on reject
+  - yahoo_feed.py: REAL market fallback (Yahoo Finance 1m candles) — টোকেন ছাড়াও অ্যাপে রিয়েল ডেটা, কখনো সিমুলেশন নয়
+  - candle_store/levels/structure/patterns/signal_engine/backtest: exact ports; db.py self-bootstrapping + purges legacy SIM data; market_engine.py live-only; main.py aiohttp+python-socketio (/engine + /qx-health + Next reverse proxy, duplicate-guard, EADDRINUSE retry)
+- DIFFERENTIAL VERIFICATION: old TS engine vs new Python engine on same 16,243-candle dataset → 15/15 signals IDENTICAL (fixed cluster-flush bug + JS-round grid bug to reach bit-parity)
+- REAL-DATA BACKTEST: 15,089 Yahoo real 1m candles (8 pairs) → 15 signals @70%, WR 60% (W9/L6); UI backtest button verified live
+- Frontend: types moved to src/lib/qx-types.ts; SIM UI removed (mode selector, labels); honest feed labels (লাইভ Quotex টিক / রিয়েল মার্কেট ডেটা / সংযোগ হচ্ছে); ssid token hints
+- Deploy: Dockerfile node:22-slim + python3 venv baked; start.sh supervises Python engine + Next (prisma push dropped — engine bootstraps schema); nixpacks.toml installs python3 for any builder
+- Browser-verified via :81 — real prices ticking (EURUSD 1.15420, USDJPY 154.824), candle chart renders, running-candle panel + countdown, expired-token paste → isDemo auto-flip → clear বাংলা verdict in ~12s, market feed continues; zero console/page errors; mobile screenshot OK
+- Fixes during test: socket.io event names (get-status hyphens), websockets-16 .state API, duplicate candle timestamps (chart assertion), Setting.updatedAt NOT NULL
+- Committed 04f567a + pushed GitHub main (inline PAT only, remote clean, staged-diff secret scan CLEAN)
+
+Stage Summary:
+- অ্যাপ এখন রিয়েল-ডেটা-অনলি: Quotex টোকেন দিলে ws2.qxbroker.com টিক-বাই-টিক; টোকেন না থাকলে/মেয়াদ শেষ হলে রিয়েল ইন্টারব্যাংক ফিড — কখনো ফেক/সিম নয়
+- ইউজারের টোকেনটি মেয়াদোত্তীর্ণ (দুই স্বাধীন implementation-এ verify) — নতুন ssid টোকেন নিতে হবে
+- User action: Railway Redeploy → Settings-এ নতুন টোকেন পেস্ট → কয়েক সেকেন্ডে Quotex লাইভ
