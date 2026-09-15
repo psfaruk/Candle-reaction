@@ -122,3 +122,28 @@ Stage Summary:
 - Engine now runs stable in dev (PPID=1 orphan pattern + --watch)
 - Deployed app gets same fix after Railway redeploy (commit ea3a703 on main)
 - Screenshots: download/qx-signals-fixed.png, download/qx-settings-fixed.png
+
+---
+Task ID: 7
+Agent: main (Super Z)
+Task: Fix "token paste → notification says engine not on" + make engine 24/7 (সারাক্ষণ) + token works instantly (user request)
+
+Work Log:
+- Diagnosed: sandbox engine was healthy → problem was on deployed app + latent crash/time bombs in code
+- ROOT CAUSE 1 (engine death): bun exits the whole process on ANY unhandledRejection — persistCandles' unprotected findMany + two fire-and-forget `void this.persistCandles(...)` call sites (one runs EVERY minute per pair) could kill the engine on a single SQLite hiccup → socket dead → "ইঞ্জিন চালু নাই"
+- ROOT CAUSE 2 (token timeout race): startLive resolved ONLY after a flat 15s timeout even on success → raced the 15s frontend rpc timeout → "রিকোয়েস্ট টাইমআউট" toast (looked like dead engine)
+- ROOT CAUSE 3 (Nixpacks): start.sh launched engine with bun only — node-only images could NEVER start the engine
+- FIX engine/index.ts: global uncaughtException/unhandledRejection handlers (log & continue — engine immortal)
+- FIX market-engine.ts: persistCandles fully wrapped (findMany protected), .catch() on both void call sites, startLive rewritten → instant success on first live tick, fast-fail 3s after definitive WS failure (clear Bengali reason), 15s hard cap; token DB-save made non-fatal
+- FIX engine-provider.tsx: rpc timeout 15s → 20s (covers 15s hard cap + ack latency)
+- FIX db.ts: SQLite WAL + busy_timeout=5000 + synchronous=NORMAL (per-pragma queryRaw→executeRaw fallback — empirically runtime-dependent: busy_timeout fails both ways under node, journal_mode returns a row)
+- FIX start.sh: ROOT_DIR resolution + engine runtime fallback bun → node+tsx (tsx added as root dependency; engine deps resolve from root node_modules)
+- NEW scripts/engine-supervisor.sh (sandbox watchdog, gitignored as sandbox-ops): infinite restart loop, 2s revive, 10MB log cap; launched via orphan-to-init pattern (PPID=1)
+- VERIFIED: kill -9 engine → watchdog revived in 2s → health 200 → browser socket auto-reconnected ("ইঞ্জিন সংযুক্ত") → live market flowing; dummy token → clear toast in ~6s ("Quotex সার্ভারে পৌঁছানো যাচ্ছে না..." — honest sandbox CF-block message) + token saved (masked badge Q4Test••••••1234) + auto-retry from DB on every engine restart (boot log shows attempt 1,2,...); node+tsx boot clean (0 prisma errors); WAL active on the DB; lint clean
+- Committed 4edf0d4 + pushed to GitHub main (verified via API; token used inline only)
+
+Stage Summary:
+- Engine is now 3-layer immortal: crash-proof process + watchdog (sandbox) / start.sh supervisor (Railway) + auto-revive UI (12s rpc wait + 30s socket revive)
+- Token flow instant & self-explanatory: ~6s clear verdict; saved token auto-retries live on EVERY restart forever
+- Works under ANY Railway builder (Dockerfile bun OR Nixpacks node+tsx)
+- User action: Railway Redeploy → verify /qx-health → paste real token (if Quotex blocks Railway IP, message will say so honestly)
