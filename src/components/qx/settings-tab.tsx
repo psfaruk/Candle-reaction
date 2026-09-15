@@ -141,7 +141,7 @@ export function SettingsTab() {
                   className="border-zinc-700 bg-zinc-800/60 font-mono text-xs"
                   autoComplete="off"
                 />
-                <Button onClick={connect} disabled={connecting || !connected} className="bg-emerald-600 text-white hover:bg-emerald-500">
+                <Button onClick={connect} disabled={connecting} className="bg-emerald-600 text-white hover:bg-emerald-500">
                   {connecting ? 'সংযোগ হচ্ছে...' : 'সংযোগ করুন'}
                 </Button>
                 <Button onClick={disconnectLive} variant="outline" className="border-zinc-700 text-zinc-300">
@@ -154,9 +154,9 @@ export function SettingsTab() {
                 )}
               </div>
               {!connected && (
-                <p className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-[11px] leading-relaxed text-red-300">
-                  ⚠ ইঞ্জিনে সংযোগ হয়নি — তাই টোকেন/সেটিংস বাটন নিষ্ক্রিয়। ডিপ্লয়ের সময় <span className="font-mono">/qx-health</span> ঠিক আছে কিনা দেখুন (DEPLOY.md)।
-                  "ইঞ্জিন পুনঃসংযোগ" চাপুন অথবা পেজ রিফ্রেশ করুন।
+                <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-200/90">
+                  ⚠ ইঞ্জিনের সাথে সংযোগ এখন বিচ্ছিন্ন — তবে সব বাটন সচল: চাপলে অ্যাপ নিজেই পুনঃসংযোগের চেষ্টা করবে (১২ সে.)।
+                  ইঞ্জিন চালু থাকলে সব ঠিক হয়ে যাবে; ডিপ্লয়ে <span className="font-mono">/qx-health</span> চেক করুন (DEPLOY.md)।
                 </p>
               )}
               <p className="text-[11px] leading-relaxed text-zinc-500">
@@ -215,7 +215,7 @@ export function SettingsTab() {
             </div>
 
             <div className="flex gap-2">
-              <Button onClick={save} disabled={saving || !connected} className="bg-emerald-600 text-white hover:bg-emerald-500">
+              <Button onClick={save} disabled={saving} className="bg-emerald-600 text-white hover:bg-emerald-500">
                 {saving ? 'সংরক্ষণ হচ্ছে...' : 'সংরক্ষণ করুন'}
               </Button>
               <Button onClick={reconnect} variant="outline" className="border-zinc-700 text-zinc-300">সকেট রিকানেক্ট</Button>
@@ -231,7 +231,7 @@ export function SettingsTab() {
           <CardHeader className="pb-2">
             <CardTitle className="flex items-center justify-between text-sm">
               <span>ওয়াক-ফরওয়ার্ড ব্যাকটেস্ট (শেষ ~২ দিনের ১ম ক্যান্ডেল)</span>
-              <Button onClick={runBacktest} disabled={btRunning || !connected} size="sm" className="bg-emerald-600 text-white hover:bg-emerald-500">
+              <Button onClick={runBacktest} disabled={btRunning} size="sm" className="bg-emerald-600 text-white hover:bg-emerald-500">
                 {btRunning ? 'চলছে...' : 'ব্যাকটেস্ট চালান'}
               </Button>
             </CardTitle>
@@ -348,14 +348,15 @@ export function SettingsTab() {
 }
 
 function GetRaw() {
-  const { rpc } = useEngine();
+  const { rpc, connected } = useEngine();
   const [lines, setLines] = useState<string[]>([]);
   useEffect(() => {
+    if (!connected) return;
     const load = () => rpc<{ raw: string[] }>('get-log').then((r) => setLines(r.raw ?? [])).catch(() => {});
     void load();
     const iv = setInterval(() => void load(), 4000);
     return () => clearInterval(iv);
-  }, [rpc]);
+  }, [rpc, connected]);
   if (!lines.length) return <p className="px-2 text-zinc-600">লাইভ সংযোগের পর এখানে raw WS ইভেন্ট দেখা যাবে</p>;
   return (
     <>

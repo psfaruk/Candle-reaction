@@ -92,20 +92,42 @@ export function EngineProvider({ children }: { children: ReactNode }) {
 
   const rpc = useCallback(<T,>(event: string, payload?: unknown): Promise<T> => {
     return new Promise<T>((resolve, reject) => {
+      const emit = (sock: Socket) => {
+        const timer = setTimeout(() => reject(new Error('রিকোয়েস্ট টাইমআউট')), 15000);
+        sock.emit(event, payload ?? {}, (r: T) => {
+          clearTimeout(timer);
+          resolve(r);
+        });
+      };
       const s = socketRef.current;
-      if (!s || !s.connected) {
-        reject(new Error('ইঞ্জিনে সংযুক্ত নয়'));
+      if (s && s.connected) {
+        emit(s);
         return;
       }
-      const timer = setTimeout(() => reject(new Error('রিকোয়েস্ট টাইমআউট')), 15000);
-      s.emit(event, payload ?? {}, (r: T) => {
-        clearTimeout(timer);
-        resolve(r);
-      });
+      // সকেট ডাউন → সকেট.অআই-এর অটো-রিকানেক্টের জন্য ১২ সে. পর্যন্ত অপেক্ষা করে
+      // তারপর রিকোয়েস্ট পাঠানো হয় — বাটন ক্লিক কখনো বৃথা যায় না
+      const startedAt = Date.now();
+      const iv = setInterval(() => {
+        const s2 = socketRef.current;
+        if (s2 && s2.connected) {
+          clearInterval(iv);
+          emit(s2);
+        } else if (Date.now() - startedAt > 12000) {
+          clearInterval(iv);
+          reject(new Error('ইঞ্জিন এখনো সাড়া দিচ্ছে না — ইঞ্জিন চালু হলে বাটন নিজেই কাজ করবে, একটু পরে আবার চাপুন'));
+        }
+      }, 250);
     });
   }, []);
 
   const reconnect = useCallback(() => setNonce((n) => n + 1), []);
+
+  // স্টাক-সকেট অটো-রিভাইভ: ৩০ সে. ধরে সংযোগ না হলে সকেট নতুন করে তৈরি হয়
+  useEffect(() => {
+    if (connected) return;
+    const t = setTimeout(() => setNonce((n) => n + 1), 30000);
+    return () => clearTimeout(t);
+  }, [connected, nonce]);
 
   // refresh settings periodically (token connect / save happen in other tabs)
   useEffect(() => {

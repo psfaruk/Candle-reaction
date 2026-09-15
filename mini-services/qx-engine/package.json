@@ -4,7 +4,7 @@
   "private": true,
   "description": "QX candle-reaction signal engine: Quotex live feed / simulator, tick-level candle analysis, confluence signals, backtest",
   "scripts": {
-    "dev": "bun --hot index.ts",
+    "dev": "bun --watch index.ts",
     "start": "bun index.ts"
   },
   "dependencies": {
