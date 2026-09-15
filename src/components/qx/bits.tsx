@@ -3,7 +3,7 @@
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
-import type { Direction, SignalResult, StatsBlock } from '../../../mini-services/qx-engine/src/types';
+import type { Direction, SignalResult, StatsBlock } from '@/lib/qx-types';
 
 export function DirectionBadge({ d, size = 'sm' }: { d: Direction; size?: 'sm' | 'lg' }) {
   return (

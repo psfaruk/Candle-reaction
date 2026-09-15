@@ -1,0 +1,3 @@
+websockets>=12.0
+python-socketio[aiohttp]>=5.11
+aiohttp>=3.9

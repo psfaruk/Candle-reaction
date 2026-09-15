@@ -5,7 +5,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Card, CardContent } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Skeleton } from '@/components/ui/skeleton';
-import type { Candle, PairStat, SignalRec, StatsBlock } from '../../../mini-services/qx-engine/src/types';
+import type { Candle, PairStat, SignalRec, StatsBlock } from '@/lib/qx-types';
 import { useEngine } from './engine-provider';
 import { DirectionBadge, EmptyState, ResultBadge, SectionTitle, fmtTime } from './bits';
 import { RunningCandlePanel } from './running-candle-panel';

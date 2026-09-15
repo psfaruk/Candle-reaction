@@ -5,7 +5,7 @@ import {
   createChart, ColorType, CrosshairMode,
   type IChartApi, type ISeriesApi, type UTCTimestamp, type SeriesMarker, type Time,
 } from 'lightweight-charts';
-import type { Candle, SignalRec } from '../../../mini-services/qx-engine/src/types';
+import type { Candle, SignalRec } from '@/lib/qx-types';
 
 interface Props {
   candles: Candle[];

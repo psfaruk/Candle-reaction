@@ -3,7 +3,7 @@
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
 import { Separator } from '@/components/ui/separator';
-import type { RunningCandleState } from '../../../mini-services/qx-engine/src/types';
+import type { RunningCandleState } from '@/lib/qx-types';
 import { EmptyState, fmtNum } from './bits';
 
 // ============ রানিং ক্যান্ডেল অ্যানালাইজার ============

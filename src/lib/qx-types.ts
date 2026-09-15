@@ -1,15 +1,17 @@
 // ============ QX Engine — Shared Types ============
+// (moved from mini-services — the engine is Python now; the browser contract
+//  stays identical: socket.io path /engine + the same events)
 
 export interface PairDef {
   symbol: string;
-  name: string; // display name
-  digits: number; // price decimals
-  pip: number; // pip size (0.0001 / 0.01)
-  basePrice: number; // simulator starting price
-  volPips: number; // simulator: pips stdev per minute
+  name: string;
+  digits: number;
+  pip: number;
+  basePrice: number;
+  volPips: number;
 }
 
-export type FeedSource = 'LIVE' | 'SIM';
+export type FeedSource = 'LIVE';
 export type Direction = 'CALL' | 'PUT';
 export type SignalResult = 'PENDING' | 'WIN' | 'LOSS' | 'TIE';
 export type CandleColor = 'GREEN' | 'RED' | 'FLAT';
@@ -68,46 +70,7 @@ export interface Zone {
   kind: 'swing' | 'round';
 }
 
-export interface ZoneTest {
-  zone: Zone;
-  touched: boolean; // candle wicked into zone
-  swept: boolean; // candle closed through beyond zone (invalidation)
-  distancePips: number; // from candle extreme to zone price
-}
-
 export type TrendDir = 'UP' | 'DOWN' | 'RANGE';
-
-export interface StructureInfo {
-  trend: TrendDir;
-  emaFast: number;
-  emaSlow: number;
-  swingTrend: TrendDir;
-  strength: number; // 0..100
-  atrPips: number;
-  consecutiveBull: number;
-  consecutiveBear: number;
-  pullback: boolean; // recent dip to EMA zone and recovery
-}
-
-export interface CandlePattern {
-  bodyPips: number;
-  rangePips: number;
-  upperWickPips: number;
-  lowerWickPips: number;
-  bodyRatio: number; // body / range (0..1)
-  clv: number; // close location value -1..+1
-  isBull: boolean;
-  isBear: boolean;
-  isPinBull: boolean;
-  isPinBear: boolean;
-  isEngulfBull: boolean;
-  isEngulfBear: boolean;
-  isDoji: boolean;
-  isMarubozu: boolean;
-  tickImbalance: number; // (up - down) / ticks  -1..+1
-  lateFlip: number;
-  lateMomentumPips: number;
-}
 
 // -------- Live runtime states --------
 
@@ -159,7 +122,11 @@ export interface PairMarketState {
 
 export interface EngineStatus {
   mode: FeedSource | 'CONNECTING';
-  desiredMode: 'auto' | 'live' | 'simulation';
+  desiredMode: string;
+  /** quotex = লাইভ টোকেন টিক ফিড | market = রিয়েল মার্কেট ফিড (টোকেন ছাড়া) | none */
+  feedProvider?: 'quotex' | 'market' | 'none';
+  /** none | idle | pending | ok | rejected */
+  qxAuthState?: string;
   liveConnected: boolean;
   socketClients: number;
   serverTime: number;
@@ -214,6 +181,37 @@ export interface SignalFilter {
   pair?: string | 'ALL';
   direction?: Direction | 'ALL';
   periodH?: number | 0; // 0 = all time
-  source?: FeedSource[] | 'BACKTEST'[];
+  source?: string[];
   limit?: number;
+}
+
+// -------- Backtest --------
+
+export interface BTPairResult {
+  pair: string;
+  signals: number;
+  wins: number;
+  losses: number;
+  ties: number;
+  winRate: number;
+  callSignals: number;
+  callWins: number;
+  putSignals: number;
+  putWins: number;
+  avgScore: number;
+  bestHour: { hour: number; winRate: number; signals: number } | null;
+  maxWinStreak: number;
+  maxLossStreak: number;
+}
+
+export interface BTSummary {
+  id: string;
+  ranAt: number;
+  candlesTested: number;
+  from: number;
+  to: number;
+  minConfidence: number;
+  overall: { signals: number; wins: number; losses: number; ties: number; winRate: number };
+  perPair: BTPairResult[];
+  perHour: { hour: number; signals: number; winRate: number }[];
 }

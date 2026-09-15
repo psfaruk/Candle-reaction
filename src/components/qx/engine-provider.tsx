@@ -4,7 +4,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState, ty
 import { io, type Socket } from 'socket.io-client';
 import type {
   EngineStatus, LogLine, MarketSnapshot, SignalRec, Candle,
-} from '../../../mini-services/qx-engine/src/types';
+} from '@/lib/qx-types';
 
 export interface EngineSettingsView {
   tokenMasked: string;

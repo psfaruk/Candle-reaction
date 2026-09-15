@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import type { PairStat, SignalRec, StatsBlock } from '../../../mini-services/qx-engine/src/types';
+import type { PairStat, SignalRec, StatsBlock } from '@/lib/qx-types';
 import { useEngine } from './engine-provider';
 import { DirectionBadge, EmptyState, ResultBadge, WinRateCard, fmtTime, SectionTitle } from './bits';
 

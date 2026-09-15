@@ -6,11 +6,10 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Separator } from '@/components/ui/separator';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useToast } from '@/hooks/use-toast';
-import type { BTSummary } from '../../../mini-services/qx-engine/src/engine/backtest';
+import type { BTSummary } from '@/lib/qx-types';
 import { useEngine } from './engine-provider';
 import { SectionTitle } from './bits';
 
@@ -23,7 +22,6 @@ export function SettingsTab() {
   const [btSummary, setBtSummary] = useState<BTSummary | null>(null);
   const [selPairs, setSelPairs] = useState<string[]>([]);
   const [minConf, setMinConf] = useState(70);
-  const [mode, setMode] = useState('auto');
   const [saving, setSaving] = useState(false);
   const [showRaw, setShowRaw] = useState(false);
 
@@ -31,7 +29,6 @@ export function SettingsTab() {
     if (settings) {
       setSelPairs(settings.pairs);
       setMinConf(settings.minConfidence);
-      setMode(settings.mode);
     }
   }, [settings]);
 
@@ -43,7 +40,7 @@ export function SettingsTab() {
 
   const connect = async () => {
     if (!token.trim()) {
-      toast({ title: 'টোকেন দিন', description: 'Quotex থেকে q9securid কুকি কপি করে পেস্ট করুন', variant: 'destructive' });
+      toast({ title: 'টোকেন দিন', description: 'Quotex থেকে ssid সেশন টোকেন কপি করে পেস্ট করুন', variant: 'destructive' });
       return;
     }
     setConnecting(true);
@@ -69,7 +66,7 @@ export function SettingsTab() {
     setSaving(true);
     try {
       const r = await rpc<{ ok: boolean; msg: string }>('save-settings', {
-        pairs: selPairs, minConfidence: minConf, mode,
+        pairs: selPairs, minConfidence: minConf,
       });
       toast({ title: 'সংরক্ষিত', description: r.msg });
     } catch (e: any) {
@@ -113,10 +110,22 @@ export function SettingsTab() {
           <CardContent className="space-y-4 p-4">
             <div className="flex flex-wrap items-center gap-2 text-xs">
               <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-medium ${
-                status?.mode === 'LIVE' ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400' : 'border-amber-500/40 bg-amber-500/10 text-amber-400'
+                status?.mode === 'LIVE'
+                  ? status?.feedProvider === 'quotex'
+                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400'
+                    : 'border-teal-500/40 bg-teal-500/10 text-teal-300'
+                  : 'border-amber-500/40 bg-amber-500/10 text-amber-400'
               }`}>
-                <span className={`h-1.5 w-1.5 rounded-full ${status?.mode === 'LIVE' ? 'bg-emerald-400' : 'bg-amber-400'} animate-pulse`} />
-                {status?.mode === 'LIVE' ? 'লাইভ Quotex ডেটা চলছে' : 'সিমুলেশন মোড'}
+                <span className={`h-1.5 w-1.5 rounded-full ${
+                  status?.mode === 'LIVE'
+                    ? status?.feedProvider === 'quotex' ? 'bg-emerald-400' : 'bg-teal-300'
+                    : 'bg-amber-400'
+                } animate-pulse`} />
+                {status?.mode === 'LIVE'
+                  ? status?.feedProvider === 'quotex'
+                    ? 'লাইভ Quotex টিক ডেটা চলছে'
+                    : 'রিয়েল মার্কেট ডেটা চলছে (টোকেন দিলে Quotex টিকে সুইচ হবে)'
+                  : 'Quotex সংযোগের অপেক্ষায়…'}
               </span>
               {settings?.tokenSource === 'env' && (
                 <span className="inline-flex items-center gap-1.5 rounded-full border border-sky-500/40 bg-sky-500/10 px-2.5 py-1 font-medium text-sky-400">
@@ -130,7 +139,7 @@ export function SettingsTab() {
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="qx-token" className="text-zinc-300">QX টোকেন (authorization লাইন বা q9securid কুকি)</Label>
+              <Label htmlFor="qx-token" className="text-zinc-300">QX সেশন টোকেন (authorization লাইন বা ssid কুকি)</Label>
               <div className="flex flex-col gap-2 sm:flex-row">
                 <Input
                   id="qx-token"
@@ -164,7 +173,7 @@ export function SettingsTab() {
                 <br />
                 <span className="text-zinc-400">①</span> qxbroker.com-এ লগইন করুন → <b className="text-zinc-400">F12</b> → <b className="text-zinc-400">Network</b> ট্যাব → <b className="text-zinc-400">WS</b> লিখে ফিল্টার করুন → socket.io/ws2 কানেকশনে ক্লিক করুন → <b className="text-zinc-400">Messages</b> ট্যাব → আপনার ব্রাউজারের পাঠানো সবুজ রঙের <span className="font-mono text-zinc-400">42[&quot;authorization&quot;,&#123;&quot;session&quot;:&quot;…&quot;&#125;]</span> লাইনটি <b className="text-zinc-400">পুরোপুরি কপি</b> করে এখানে পেস্ট করুন।
                 <br />
-                <span className="text-zinc-400">②</span> DevTools → <b className="text-zinc-400">Application</b> → Cookies → <span className="font-mono text-zinc-400">q9securid</span>-এর ভ্যালু কপি করুন।
+                <span className="text-zinc-400">②</span> DevTools → <b className="text-zinc-400">Application</b> → Cookies → <span className="font-mono text-zinc-400">ssid</span> (বা <span className="font-mono text-zinc-400">q9securid</span>)-এর ভ্যালু কপি করুন।
                 <br />
                 <span className="text-amber-500/80">⚠</span> পুরো authorization লাইন পেস্ট করলেও হবে — অ্যাপ নিজে টোকেনটি বের করে নেয়। টোকেন কয়েক ঘণ্টা/দিন পর <b className="text-zinc-400">মেয়াদ শেষ হয়ে যায়</b> — তখন "প্রত্যাখ্যাত" দেখালে নতুন করে কপি করতে হবে। টোকেন সার্ভারে সংরক্ষিত হয়, ব্রাউজারে ফুল টোকেন আর দেখা যায় না।
                 <br />
@@ -205,17 +214,13 @@ export function SettingsTab() {
                 <p className="text-[11px] text-zinc-500">বেশি কনফিডেন্স = কম কিন্তু মানসম্মত সিগন্যাল। ৭০% ব্যালেন্সড।</p>
               </div>
               <div className="space-y-2">
-                <Label className="text-zinc-300">ফিড মোড</Label>
-                <Select value={mode} onValueChange={setMode}>
-                  <SelectTrigger className="border-zinc-700 bg-zinc-800/60">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent className="border-zinc-700 bg-zinc-900">
-                    <SelectItem value="auto">অটো (টোকেন থাকলে লাইভ, না হলে সিমুলেশন)</SelectItem>
-                    <SelectItem value="live">শুধু লাইভ</SelectItem>
-                    <SelectItem value="simulation">শুধু সিমুলেশন</SelectItem>
-                  </SelectContent>
-                </Select>
+                <Label className="text-zinc-300">ডেটা ফিড</Label>
+                <div className="rounded-md border border-teal-500/30 bg-teal-500/5 px-3 py-2.5 text-xs leading-relaxed text-teal-200/90">
+                  <b>রিয়েল-ডেটা-অনলি ইঞ্জিন (Python)</b>
+                  <br />
+                  Quotex সেশন টোকেন দিলে ws2.qxbroker.com থেকে টিক-বাই-টিক লাইভ ফিড + আপনার ব্যালেন্স আসে।
+                  টোকেন না থাকলে একই পেয়ারের রিয়েল ইন্টারব্যাংক মার্কেট ডেটা চলে — কোনো সিমুলেশন নেই।
+                </div>
               </div>
             </div>
 
@@ -299,8 +304,8 @@ export function SettingsTab() {
                 <p className="text-[11px] leading-relaxed text-zinc-500">
                   ব্যাকটেস্ট রান: {new Date(btSummary.ranAt).toLocaleString('en-GB')} | ন্যূনতম কনফিডেন্স {btSummary.minConfidence}% |
                   পরিসর: {new Date(btSummary.from).toLocaleString('en-GB')} → {new Date(btSummary.to).toLocaleString('en-GB')} |
-                  ব্যাকটেস্ট সিগন্যালগুলো &quot;বিটি&quot; ট্যাগে সিগন্যাল হিস্ট্রিতে দেখা যায় (লাইভ ফিল্টারে আসে না)।
-                  সতর্কতা: অতীত পারফরম্যান্স ভবিষ্যতের নিশ্চয়তা নয় — বিশেষত সিমুলেটেড ডেটায়।
+                  ডেটা সোর্স: রিয়েল মার্কেট ক্যান্ডেল (Quotex টোকেন যুক্ত থাকলে Quotex হিস্ট্রি)।
+                  সতর্কতা: অতীত পারফরম্যান্স ভবিষ্যতের নিশ্চয়তা নয়।
                 </p>
               </div>
             )}

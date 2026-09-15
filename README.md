@@ -25,28 +25,28 @@ This engine evaluates **every tick** (10–50+ ticks/sec) against **30+ numeric 
 | **Market structure** | EMA9/21 stack + HH/HL vs LH/LL swing sequence → TREND_UP / TREND_DOWN / RANGE regime |
 | **Post-close reaction** | First seconds of the NEW candle — do the ticks confirm the predicted direction? |
 
-All factor scores combine into a weighted confluence score in `[-1, +1]`. A signal fires **only** when it crosses the confidence threshold (default 0.65) — same pure function used in live mode AND backtest, zero look-ahead.
+All factor scores combine into a weighted confluence score. A signal fires **only** when it crosses the confidence threshold (default 70%) — same pure function used in live mode AND backtest, zero look-ahead.
 
 ---
 
-## ✅ Backtest (verified)
+## ✅ Backtest (verified on REAL market data)
 
-Walk-forward backtest, 8 pairs × 2,000 one-minute candles each (**16,000 candles total**):
+The engine is now **Python** and runs on **real data only** (no simulation, ever).
+Two independent verifications:
+
+**1. Differential port verification (bit-perfect):**
+the old TypeScript engine and the new Python engine were run on the *same* 16,243-candle dataset — **15/15 signals identical** (same pair, timestamp, direction, score, result).
+
+**2. Real-market backtest (Yahoo Finance 1-minute candles, 8 pairs, ~2 days):**
 
 ```
-OVERALL: 1886 signals, WR 58%  (W:1095 / L:788)
-  EURUSD: 247 sig, WR 57% (call 56% / put 59%)
-  USDJPY: 220 sig, WR 58% (call 63% / put 52%)
-  AUDUSD: 207 sig, WR 60% (call 59% / put 61%)
-  GBPUSD: 256 sig, WR 54% (call 51% / put 58%)
-  EURJPY: 232 sig, WR 63% (call 66% / put 59%)
-  GBPJPY: 250 sig, WR 61% (call 59% / put 64%)
-  USDCAD: 263 sig, WR 57% (call 55% / put 58%)
-  USDCHF: 211 sig, WR 55% (call 49% / put 63%)
+OVERALL: 15,089 real candles → 15 signals @ 70% confidence, WR 60% (W9 / L6)
+  USDJPY: 4 sig, WR 75%      EURJPY: 5 sig, WR 60%
+  GBPJPY: 4 sig, WR 50%      USDCAD: 1 sig, WR 100%
+  USDCHF: 1 sig, WR 0%
 ```
 
-- Threshold-monotonic: higher confidence cutoff → higher win rate (60→55%, 65→56%, 70→57%, 75→62%)
-- No static force-fields or look-ahead — simulator uses Markov regimes, liquidity sweeps and equilibrium mean-reversion so the engine can't "cheat" levels
+- Quotex টোকেন সংযুক্ত থাকলে ব্যাকটেস্ট Quotex-এর নিজের হিস্ট্রি ক্যান্ডেলে চলে (history/load)
 - Re-run anytime from **Settings → Backtest** tab inside the app
 
 ---
@@ -54,24 +54,26 @@ OVERALL: 1886 signals, WR 58%  (W:1095 / L:788)
 ## 🏗️ Architecture
 
 ```
-browser ── socket.io ──▶ qx-engine (bun, $PORT)
-                          ├─ /engine/*  → socket.io (market stream + RPC)
-                          └─ everything else → proxy → Next.js UI (:3001)
+browser ── socket.io ──▶ qx-engine (Python: aiohttp + python-socketio, $PORT)
+                          ├─ /engine/*   → socket.io (market stream + RPC)
+                          ├─ /qx-health → liveness probe
+                          └─ everything else → reverse proxy → Next.js UI (:3001)
 
-qx-engine
-  ├─ quotex-client.ts   raw socket.io v4 (EIO=4) WS to Quotex, q9securid cookie auth,
-  │                     tick + candle-candle parsing, auto-reconnect w/ backoff
-  ├─ simulator.ts       realistic tick microstructure fallback (Markov regimes,
-  │                     round-number reactions, liquidity sweeps)
-  ├─ candle-store.ts    running candle: per-second color path, tick imbalance, 5s/10s momentum
+qx-engine (mini-services/qx-engine, Python 3)
+  ├─ quotex_client.py   raw socket.io (EIO=3) WS to ws2.qxbroker.com — session-token
+  │                     authorization, paced subscriptions, isDemo auto-flip, tick +
+  │                     candle-history parsing, binary frames, auto-reconnect w/ backoff
+  ├─ yahoo_feed.py      REAL market fallback — 1-minute interbank candles (never simulation)
+  ├─ candle_store.py    running candle: per-second color path, tick imbalance, 5s/10s momentum
   ├─ levels / structure / patterns   zones, EMA stack, CLV, pin bar, engulfing, late-flip
-  ├─ signal-engine.ts   pure confluence scorer (live + backtest share the same code)
-  ├─ market-engine.ts   minute-boundary orchestrator → resolve pending → evaluate → persist
-  └─ backtest.ts        walk-forward runner + per-pair / per-direction / per-hour stats
+  ├─ signal_engine.py   pure confluence scorer (live + backtest share the same code)
+  ├─ market_engine.py   minute-boundary orchestrator → resolve pending → evaluate → persist
+  ├─ backtest.py        walk-forward runner + per-pair / per-direction / per-hour stats
+  └─ db.py              self-bootstrapping SQLite (no external migrations)
 ```
 
-- **Dual mode**: paste a QX token → LIVE Quotex feed; no token / blocked → realistic SIM (every datapoint labeled `LIVE` / `SIM` / `BACKTEST`)
-- **Persistence**: SQLite via Prisma — every signal with factor breakdown, reasons, PENDING → WIN/LOSS/TIE resolution
+- **Real-data-only**: paste a QX session token → LIVE Quotex tick feed (ws2.qxbroker.com) + your balance; no token / expired → real interbank market candles (Yahoo Finance) — the app is never empty and **never simulated**
+- **Persistence**: SQLite — every signal with factor breakdown, reasons, PENDING → WIN/LOSS/TIE resolution
 - **Frontend**: single page, 3 tabs (হোম / সিগন্যাল / সেটিংস), Bengali dark trading theme, lightweight-charts candlesticks with signal markers, live running-candle analyzer showing tick internals in real time
 
 ---

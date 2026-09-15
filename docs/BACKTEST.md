@@ -42,8 +42,9 @@ Higher confidence → fewer but more accurate signals (monotonic, as expected fo
 
 ## Notes
 
-- Simulator physics: Markov momentum regimes, round-number touch→reaction bursts, liquidity sweeps with snap-back, equilibrium mean-reversion — designed so the engine **cannot** cheat by reading static level force-fields
-- Data labeled `BACKTEST` separately from `LIVE` / `SIM` in the DB
+- Data source: **REAL market candles only** (Yahoo Finance 1-minute bars; Quotex-এর নিজের হিস্ট্রি টোকেন যুক্ত থাকলে) — সিমুলেশন সম্পূর্ণ বাদ
+- Python port verified bit-perfect vs the old TS engine: 15/15 identical signals on the same 16,243-candle dataset
+- Data labeled `BACKTEST` separately from `LIVE` in the DB
 - Re-runnable from the app: **Settings → Backtest** or via RPC `run-backtest`
 
-> Education/research only. Past simulated performance does not guarantee future live results.
+> Education/research only. Past performance does not guarantee future results.

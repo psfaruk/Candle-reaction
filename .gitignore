@@ -64,3 +64,8 @@ download/
 node_modules/
 mini-services/*/node_modules/
 .zscripts/
+
+# python engine artifacts
+__pycache__/
+*.pyc
+tool-results/

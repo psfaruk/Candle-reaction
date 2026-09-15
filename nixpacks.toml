@@ -1,7 +1,21 @@
 # Nixpacks fallback config — used ONLY if Railway builds this repo with the
 # Nixpacks builder instead of the Dockerfile (railway.json prefers Docker).
-# The start command is the same bash supervisor: it boots Next.js standalone
-# on an internal port AND the qx-engine (socket.io + proxy) on $PORT, so the
-# full app works identically no matter which builder Railway picks.
+# Installs Python (for the qx-engine) alongside Node, then the same bash
+# supervisor boots Next.js standalone internally AND the Python engine on
+# $PORT, so the full app works identically no matter which builder is used.
+
+[phases.setup]
+nixPkgs = []
+aptPkgs = ["bash", "python3", "python3-venv", "python3-pip"]
+
+[phases.install]
+cmds = [
+  "npm install --no-audit --no-fund || true",
+  "python3 -m venv /opt/qxvenv && /opt/qxvenv/bin/pip install --no-cache-dir -r mini-services/qx-engine/requirements.txt"
+]
+
+[phases.build]
+cmds = ["npm run build"]
+
 [start]
-  cmd = "bash deploy/start.sh"
+cmd = "bash deploy/start.sh"

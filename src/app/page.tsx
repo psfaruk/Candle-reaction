@@ -36,9 +36,17 @@ function StatusBadges() {
         {connected ? 'ইঞ্জিন সংযুক্ত' : 'সংযোগ বিচ্ছিন্ন'}
       </span>
       <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium ${
-        status?.mode === 'LIVE' ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400' : 'border-amber-500/40 bg-amber-500/10 text-amber-400'
+        status?.mode === 'LIVE'
+          ? status?.feedProvider === 'quotex'
+            ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400'
+            : 'border-teal-500/40 bg-teal-500/10 text-teal-300'
+          : 'border-amber-500/40 bg-amber-500/10 text-amber-400'
       }`}>
-        {status?.mode === 'LIVE' ? '● লাইভ Quotex' : '● সিমুলেশন'}
+        {status?.mode === 'LIVE'
+          ? status?.feedProvider === 'quotex'
+            ? '● লাইভ Quotex (টিক)'
+            : '● রিয়েল মার্কেট ডেটা'
+          : '● সংযোগ হচ্ছে…'}
       </span>
       {status && (
         <span className="hidden rounded-full border border-zinc-700 bg-zinc-800/60 px-2.5 py-1 text-[11px] text-zinc-400 sm:inline-flex">
