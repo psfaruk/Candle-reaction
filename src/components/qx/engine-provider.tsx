@@ -93,7 +93,8 @@ export function EngineProvider({ children }: { children: ReactNode }) {
   const rpc = useCallback(<T,>(event: string, payload?: unknown): Promise<T> => {
     return new Promise<T>((resolve, reject) => {
       const emit = (sock: Socket) => {
-        const timer = setTimeout(() => reject(new Error('রিকোয়েস্ট টাইমআউট')), 15000);
+        // ২০ সে.: connect-token সর্বোচ্চ ১৫ সে. বিশ্লেষণ করে তারপর উত্তর দেয়
+        const timer = setTimeout(() => reject(new Error('রিকোয়েস্ট টাইমআউট')), 20000);
         sock.emit(event, payload ?? {}, (r: T) => {
           clearTimeout(timer);
           resolve(r);

@@ -5,6 +5,22 @@ import { MarketEngine } from './src/engine/market-engine';
 import { ensureSchema, ensureSettings } from './src/db';
 import { ALL_PAIRS } from './src/pairs';
 
+// ============================================================
+// 🛡 CRASH PROTECTION — ইঞ্জিন সারাক্ষণ চালু থাকবে।
+// bun/node ডিফল্টে unhandled rejection-এ প্রসেস মেরে ফেলে —
+// একটা stray async এররে (DB lock, WS glitch) পুরো অ্যাপ ডাউন হতো।
+// এখন এরর লগ হবে, প্রসেস বেঁচে থাকবে, সকেট-সংযোগ টিকে থাকবে।
+// ============================================================
+process.on('uncaughtException', (e) => {
+  console.error('[qx-engine] ⚠ uncaughtException (অ-মারাত্মক, ইঞ্জিন চালু থাকবে):', e);
+});
+process.on('unhandledRejection', (e) => {
+  console.error('[qx-engine] ⚠ unhandledRejection (অ-মারাত্মক, ইঞ্জিন চালু থাকবে):', e);
+});
+process.on('warning', (w) => {
+  console.warn('[qx-engine] warning:', w?.message ?? w);
+});
+
 // ============ QX Engine — socket.io service ============
 // Production architecture (single public port):
 //   browser → engine:$PORT

@@ -5,7 +5,7 @@
 #  1) auto-pick SQLite location: /data (Railway volume) → /app/db
 #  2) auto-create/patch schema (prisma db push, node-run, 3 retries)
 #  3) start Next.js standalone on :3001 (node, internal)
-#  4) start qx-engine on $PORT (bun, public) — proxies web → Next
+#  4) start qx-engine on $PORT (bun → node+tsx fallback, public) — proxies web → Next
 #  5) supervise both: if either dies, restart it automatically
 #
 # Railway injects $PORT — nothing needs to be configured manually.
@@ -16,6 +16,12 @@ PORT="${PORT:-3000}"
 INTERNAL_PORT="${QX_NEXT_PORT:-3001}"
 DB_DIR=""
 DB_FILE=""
+
+# repo root (works no matter where the container CWD is)
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+# tsx = node-based TS runner; used when the image has node but NOT bun
+TSX_CLI="$ROOT_DIR/node_modules/tsx/dist/cli.mjs"
 
 log() { echo "[start $(date -u +%H:%M:%S)] $*"; }
 
@@ -75,14 +81,32 @@ start_next() {
 }
 
 # ---------- 4) qx-engine (public $PORT) ----------
+# runtime: bun if present, else node + tsx (Nixpacks images ship node only).
+# The engine itself is crash-proofed (global error handlers) — this loop
+# is belt & suspenders so the engine stays up সারাক্ষণ under any builder.
+ENGINE_RUNTIME="bun"
+if ! command -v bun >/dev/null 2>&1; then
+  if command -v node >/dev/null 2>&1 && [ -f "$TSX_CLI" ]; then
+    ENGINE_RUNTIME="node-tsx"
+  else
+    log "❌ FATAL: neither bun nor node+tsx available — engine cannot start"
+  fi
+fi
+
 start_engine() {
   # engine deps resolve from root node_modules when the engine's own
   # node_modules is absent (e.g. Nixpacks installs root deps only)
-  ( cd mini-services/qx-engine \
-    && QX_ENGINE_PORT="$PORT" QX_NEXT_PORT="$INTERNAL_PORT" \
-       DATABASE_URL="$DATABASE_URL" bun index.ts ) &
+  if [ "$ENGINE_RUNTIME" = "bun" ]; then
+    ( cd mini-services/qx-engine \
+      && QX_ENGINE_PORT="$PORT" QX_NEXT_PORT="$INTERNAL_PORT" \
+         DATABASE_URL="$DATABASE_URL" bun index.ts ) &
+  else
+    ( cd mini-services/qx-engine \
+      && QX_ENGINE_PORT="$PORT" QX_NEXT_PORT="$INTERNAL_PORT" \
+         DATABASE_URL="$DATABASE_URL" node "$TSX_CLI" index.ts ) &
+  fi
   ENGINE_PID=$!
-  log "qx-engine → 0.0.0.0:${PORT} (pid $ENGINE_PID)"
+  log "qx-engine → 0.0.0.0:${PORT} via ${ENGINE_RUNTIME} (pid $ENGINE_PID)"
 }
 
 start_next

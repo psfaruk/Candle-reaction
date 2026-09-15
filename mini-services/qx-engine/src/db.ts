@@ -79,6 +79,23 @@ export async function ensureSchema(): Promise<void> {
   for (const stmt of DDL) {
     await db.$executeRawUnsafe(stmt);
   }
+  // SQLite টিউনিং: WAL মোড + busy timeout → সমান্তরাল লেখায় "database is
+  // locked" এরর প্রায় শূন্যে নামে, ইঞ্জিন সারাক্ষণ মসৃণ থাকে।
+  // নোট: কোনো PRAGMA রেজাল্ট-সারি ফেরায় (queryRaw লাগে), কোনোটা কিছু ফেরায় না
+  // (executeRaw লাগে) — আর রানটাইমভেদে (bun/node) আচরণ বদলায়। তাই প্রতিটির
+  // জন্য queryRaw → executeRaw ফলব্যাক, সব best-effort।
+  const pragmas = [
+    'PRAGMA busy_timeout=5000;',
+    'PRAGMA journal_mode=WAL;',
+    'PRAGMA synchronous=NORMAL;',
+  ];
+  for (const p of pragmas) {
+    try {
+      await db.$queryRawUnsafe(p);
+    } catch {
+      try { await db.$executeRawUnsafe(p); } catch { /* best-effort */ }
+    }
+  }
 }
 
 export async function ensureSettings(): Promise<{

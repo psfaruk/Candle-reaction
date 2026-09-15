@@ -130,29 +130,33 @@ export class MarketEngine {
 
   private async persistCandles(cs: Candle[]) {
     if (!cs.length) return;
-    // SQLite prisma has no skipDuplicates → filter out existing ids first
-    const pairs = [...new Set(cs.map((c) => c.pair))];
-    const from = Math.min(...cs.map((c) => c.ts));
-    const to = Math.max(...cs.map((c) => c.ts));
-    const existing = await db.candle.findMany({
-      where: { pair: { in: pairs }, ts: { gte: new Date(from), lte: new Date(to) } },
-      select: { id: true },
-    });
-    const existSet = new Set(existing.map((e) => e.id));
-    const fresh = cs.filter((c) => !existSet.has(`${c.pair}:${c.ts}`));
-    for (let i = 0; i < fresh.length; i += 500) {
-      const chunk = fresh.slice(i, i + 500).map((c) => ({
-        id: `${c.pair}:${c.ts}`,
-        pair: c.pair,
-        ts: new Date(c.ts),
-        open: c.open, high: c.high, low: c.low, close: c.close,
-        ticks: c.ticks, upTicks: c.upTicks, downTicks: c.downTicks,
-        lateFlip: c.lateFlip, lateMomentum: c.lateMomentum, flipCount: c.flipCount,
-        source: c.source,
-      }));
-      try {
-        await db.candle.createMany({ data: chunk });
-      } catch { /* ignore chunk-level races */ }
+    try {
+      // SQLite prisma has no skipDuplicates → filter out existing ids first
+      const pairs = [...new Set(cs.map((c) => c.pair))];
+      const from = Math.min(...cs.map((c) => c.ts));
+      const to = Math.max(...cs.map((c) => c.ts));
+      const existing = await db.candle.findMany({
+        where: { pair: { in: pairs }, ts: { gte: new Date(from), lte: new Date(to) } },
+        select: { id: true },
+      });
+      const existSet = new Set(existing.map((e) => e.id));
+      const fresh = cs.filter((c) => !existSet.has(`${c.pair}:${c.ts}`));
+      for (let i = 0; i < fresh.length; i += 500) {
+        const chunk = fresh.slice(i, i + 500).map((c) => ({
+          id: `${c.pair}:${c.ts}`,
+          pair: c.pair,
+          ts: new Date(c.ts),
+          open: c.open, high: c.high, low: c.low, close: c.close,
+          ticks: c.ticks, upTicks: c.upTicks, downTicks: c.downTicks,
+          lateFlip: c.lateFlip, lateMomentum: c.lateMomentum, flipCount: c.flipCount,
+          source: c.source,
+        }));
+        try {
+          await db.candle.createMany({ data: chunk });
+        } catch { /* ignore chunk-level races */ }
+      }
+    } catch {
+      // DB lock/IO হলে এই ব্যাচ বাদ — ইঞ্জিন কখনো মরবে না, পরের মিনিটে আবার লেখা হবে
     }
   }
 
@@ -162,33 +166,57 @@ export class MarketEngine {
     this.stopLive();
     this.qxToken = token;
     this.tokenSource = token === (process.env.QX_TOKEN || '').trim() ? 'env' : 'db';
-    await db.setting.update({ where: { id: 'main' }, data: { qxToken: token } });
+    try {
+      await db.setting.update({ where: { id: 'main' }, data: { qxToken: token } });
+    } catch { /* টোকেন সেভ ব্যর্থ হলেও লাইভ চেষ্টা চলবে */ }
     return new Promise((resolve) => {
       let settled = false;
+      let wsEverConnected = false;
+      let firstFailAt = 0;
+      const finish = (ok: boolean, msg: string) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(probe);
+        clearTimeout(hardTimeout);
+        if (!ok) this.feed = 'SIM';
+        resolve({ ok, msg });
+      };
       this.qx = new QuotexClient(token, {
         onTick: (pair, price, t) => this.onLiveTick(pair, price, t),
         onCandles: (pair, candles) => this.onLiveCandles(pair, candles),
         onBalance: (b, cur) => { this.account.balance = b; this.account.currency = cur; },
         onStatus: (connected, reason) => {
           this.log(connected ? 'info' : 'warn', `Quotex সংযোগ: ${connected ? 'সক্রিয়' : reason}`);
-          if (connected) this.io?.emit('status', this.statusSnapshot());
+          if (connected) {
+            wsEverConnected = true;
+            this.io?.emit('status', this.statusSnapshot());
+          } else if (!wsEverConnected && !firstFailAt) {
+            firstFailAt = Date.now();
+          }
         },
         onRaw: (line) => this.pushRaw(line),
         onLog: (m) => this.log('info', m),
       });
       this.qx.connect(this.activePairs);
-      // wait up to LIVE_TICK_TIMEOUT for first ticks; else fallback to sim
-      setTimeout(() => {
-        settled = true;
+      // ⚡ দ্রুত উত্তর: প্রথম লাইভ টিক এলেই সফল; WS কখনো খুলেনি + ৩ সে. কেটে গেলে
+      // দ্রুত-ব্যর্থ (স্পষ্ট কারণসহ); সর্বোচ্চ সীমা LIVE_TICK_TIMEOUT।
+      // আগে সব কেসেই ১৫ সে. অপেক্ষা হতো — টোকেন-ক্লিকে টাইমআউট রেস তৈরি করত।
+      const probe = setInterval(() => {
         if (this.qx?.receivingTicks) {
-          resolve({ ok: true, msg: 'লাইভ টিক ডেটা চলছে' });
+          finish(true, 'লাইভ টিক ডেটা চলছে');
+        } else if (firstFailAt && Date.now() - firstFailAt > 3000) {
+          finish(false, 'Quotex সার্ভারে পৌঁছানো যাচ্ছে না (টোকেন ভুল বা সার্ভার এই আইপি ব্লক করছে) — সিমুলেশনে আছি, ব্যাকগ্রাউন্ডে চেষ্টা চলবে');
+        }
+      }, 250);
+      const hardTimeout = setTimeout(() => {
+        if (this.qx?.receivingTicks) {
+          finish(true, 'লাইভ টিক ডেটা চলছে');
+        } else if (!wsEverConnected) {
+          finish(false, 'Quotex সংযোগ পাওয়া যায়নি (নেটওয়ার্ক/আইপি ব্লক) — সিমুলেশনে আছি, ব্যাকগ্রাউন্ডে চেষ্টা চলবে');
         } else {
-          this.feed = 'SIM';
-          this.log('warn', 'লাইভ টিক পাওয়া যায়নি — সিমুলেশন ফিডে ফিরে যাওয়া হলো (ক্লায়েন্ট ব্যাকগ্রাউন্ডে চেষ্টা চালিয়ে যাবে)');
-          resolve({ ok: false, msg: 'লাইভ টিক ডেটা পাওয়া যায়নি — সিমুলেশনে ফিরে গেছে (নেটওয়ার্ক/টোকেন চেক করুন)' });
+          finish(false, 'সংযোগ হয়েছে কিন্তু টিক ডেটা আসেনি — সিমুলেশনে ফিরে গেছে (টোকেন/পেয়ার চেক করুন)');
         }
       }, LIVE_TICK_TIMEOUT);
-      void settled;
     });
   }
 
@@ -225,7 +253,7 @@ export class MarketEngine {
         ticks: 0, upTicks: 0, downTicks: 0, lateFlip: 0, lateMomentum: 0, flipCount: 0,
         source: 'LIVE' as const,
       }));
-    void this.persistCandles(mapped);
+    void this.persistCandles(mapped).catch(() => {});
     // merge into memory (replace sim candles in overlapping range)
     const liveFrom = mapped.length ? mapped[0].ts : 0;
     store.candles = store.candles.filter((c) => c.ts < liveFrom || c.source === 'LIVE');
@@ -290,7 +318,7 @@ export class MarketEngine {
     const source: FeedSource = this.feed;
     const candle = store.closeCurrent(now, source);
     if (!candle) return;
-    void this.persistCandles([candle]);
+    void this.persistCandles([candle]).catch(() => {});
 
     // 1) resolve previous pending signal with THIS candle's close
     const pend = this.pending.get(sym);
