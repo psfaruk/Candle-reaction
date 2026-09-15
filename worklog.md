@@ -225,3 +225,29 @@ Stage Summary:
 - রুট কজ: Railway-র start command engine-কে চালুই করতো না + engine-এর ৫টি ডেটা-বাগ টিক প্রবাহ আটকে রাখছিল — সব ফিক্সড
 - অ্যাপ এখন যেকোনো হোস্ট/যেকোনো start command-এ কাজ করে; বৈধ টোকেন থাকলে কয়েক সেকেন্ডে লাইভ Quotex টিক-বাই-টিক ডেটা
 - User action: Railway Redeploy → Settings-এ টোকেন দরকার নেই যদি QX_TOKEN ভ্যারিয়েবল সেট থাকে, নাহলে Settings ট্যাবে পেস্ট → "● লাইভ Quotex (টিক)" দেখাবে
+
+---
+Task ID: 11
+Agent: main (Super Z)
+Task: QX টোকেন দিলে Cloudflare ব্লক — bypass করে 100% নিশ্চিত কানেকশন (hardcoded) — সমাধান
+
+Work Log:
+- লাইভ সাইট নির্ণয়: Railway এজ 502 → "Application not found" (x-railway-fallback) — ডেপ্লয়মেন্ট আর নেই (স্টপ/ডিলিট/ক্রেডিট) — কোডে নয়, নতুন ডেপ্লয় লাগবে
+- রুট-কজ নির্ণয়: স্যান্ডবক্স IP থেকে plain websockets এখনো কাজ করে কিন্তু Railway ডেটাসেন্টার IP + Python TLS ফিঙ্গারপ্রিন্ট মিললে CF WS-upgrade-ই প্রত্যাখ্যান করে (CurlError 22 "Refused WebSocket upgrade: 403")
+- সমাধান: curl_cffi (Chrome TLS/JA3/JA4 + HTTP2 ফিঙ্গারপ্রিন্ট নকল) — tls.peet.ws এ ফিঙ্গারপ্রিন্ট ভেরিফাই; ws2.qxbroker.com এ ৪টি ছদ্মবেশ (chrome/chrome124/safari/firefox) প্রমাণিত
+- লাইভ যাচাই (টোকেন বৈধ থাকা অবস্থায়): WS open → s_authorization ✓ → ৮ পেয়র সাবস্ক্রিপশন → quotes/stream টিক ৩৯fps (75s এ ২৯০১ ফ্রেম) + history/list/v2 + balance + heartbeat '2'→'3' পঙ্গ প্রতিটি পিং-এ ০.৪s এ
+- quotex_client.py রিরাইট (886 লাইন): curl_cffi ট্রান্সপোর্ট (dedicated recv-thread + hb-thread + threading.Lock সেন্ড) প্রাথমিক; আগের যাচাইকৃত websockets async পথ ফলব্যাক; প্রোটোকল হ্যান্ডলার ১০০% অপরিবর্তিত
+- গভীর বাগ-ফিক্স (SIGABRT প্রমাণিত): libcurl handle thread-safe নয় — অন্য থ্রেডের ব্লকড recv-এর মাঝে terminate() ডাকলে প্রসেস মারা যায় → এখন terminate শুধু recv-মালিক থ্রেডই (সেন্ড-লকের আড়ালে) করে; বাইরের কিল-path = WS close-ফ্রেম + socket fd shutdown (OS-নিরাপদ, ব্লকড recv তৎক্ষণাৎ ভাঙে — আলাদা প্রোবে প্রমাণিত)
+- Race-ফিক্স: পুরনো থ্রেডের দেরিতে আসা _end_session নতুন সেশনের event ভেঙে spurious reconnect করতে পারত → সেশন-নিজস্ব ev_end ক্যাপচার
+- রিগ্রেশন-ফিক্স: ever_opened latch (isDemo-flip বিরতিতে False হলে start_live ভুল "নেটওয়ার্ক ব্লক" রায় দিতো)
+- ফিচার: CF-ব্লক ক্লাসিফায়ার (403/challenge → বাংলায় স্পষ্ট রায়) + ফিঙ্গারপ্রিন্ট অটো-রোটেশন + QX_PROXY env (IP-লেভেল ব্লকের শেষ অস্ত্র); হার্ডকোডেড WS_URL/হেডার/ছদ্মবেশ (ইউজারের নির্দেশ)
+- Deploy পথ: requirements.txt + run.sh fallback + Dockerfile/nixpacks (curl_cffi বেক/ইনস্টল)
+- যাচাই: parser ৭/৭ ইউনিট ✓; CF ক্লাসিফায়ার ✓; লাইভ flip→reject রায় ~৮s ✓ (মেয়াদোত্তীর্ণ টোকেনে, send-path প্রমাণিত); ইঞ্জিন বুট → স্পষ্ট রায় → জীবিত → /qx-health 200; RPC get-status/get-settings/run-backtest ✓; ব্যাকটেস্ট ১৫,২২২ রিয়েল ক্যান্ডেল → ১৫ সিগন্যাল @৭০% → ৯W/৬L = ৬০% WR; ২ চেষ্টার পর থামে (hammer নয়); DB-টোকেন রিস্টার্টে অটো-রিট্রাই ✓
+- ⚠ ইউজারের টোকেন (r5HB…) টেস্টের মাঝে মেয়াদোত্তীর্ণ হয়ে গেছে (আগের ঘণ্টায় বৈধ ছিল — টিকসহ প্রমাণিত; এখন দুই isDemo-তেই reject) — নতুন টোকেন লাগবে
+- সিক্রেট-স্ক্যান: staged diff ক্লিন; scripts/ gitignored (টোকেন-ধারী টেস্ট ফাইল)
+- Committed + pushed GitHub main
+
+Stage Summary:
+- Cloudflare ব্লকের স্থায়ী সমাধান: ইঞ্জিন এখন আসল Chrome ফিঙ্গারপ্রিন্ট নিয়ে কানেক্ট করে — CF-এর চোখে ব্রাউজার; Railway-র ডেটাসেন্টার IP থেকেও কাজ করার কথা (ফলব্যাক: ফিঙ্গারপ্রিন্ট রোটেশন + websockets + QX_PROXY)
+- বৈধ টোকেন দিলে: কানেক্ট → auth → টিক সব সেকেন্ড-দুয়েকের মধ্যে; মেয়াদ শেষ হলে ~৮-১২s এ স্পষ্ট বাংলা নির্দেশনা
+- ইউজার অ্যাকশন: Railway-তে নতুন ডেপ্লয় (পুরনোটা "Application not found") → qxbroker.com থেকে নতুন ssid টোকেন → Settings-এ পেস্ট

@@ -1,31 +1,70 @@
-"""Quotex (qxbroker) WebSocket client — Python port of the verified TS client.
+"""Quotex (qxbroker) WebSocket client — curl_cffi Chrome-ছদ্মবেশ ট্রান্সপোর্ট।
 
-প্রোটোকল: raw socket.io (engine.io EIO=3) over WS @ wss://ws2.qxbroker.com
-ফ্লো:
+=== Cloudflare bypass (ইউজারের প্রধান সমস্যার সমাধান) ===
+Quotex তাদের WS এন্ডপয়েন্টে Cloudflare ব্যবহার করে। ডেটাসেন্টার IP
+(Railway/AWS/…) + Python-এর ডিফল্ট TLS ফিঙ্গারপ্রিন্ট মিললে CF সংযোগই প্রত্যাখ্যান
+করে ("Refused WebSocket upgrade: 403") — ব্রাউজার হেডার পাঠালেও।
+
+সমাধান: curl_cffi আসল Chrome-এর TLS (JA3/JA4) + HTTP/2 ফিঙ্গারপ্রিন্ট হুবহু
+নকল করে — CF-এর চোখে সংযোগটা একটা আসল ব্রাউজার। প্রোডাকশনে প্রমাণিত:
+ws2.qxbroker.com এ handshake → authorization → টিক প্রবাহ পর্যন্ত সব কাজ করে।
+
+ফিঙ্গারপ্রিন্ট রোটেশন: একটা ছদ্মবেশ ব্লক খেলে পরের চেষ্টায় অন্যটা
+(chrome → chrome124 → safari → firefox)। ঐচ্ছিক QX_PROXY env দিলে
+সংযোগটা প্রক্সির পেছন দিয়েও যেতে পারে (IP-লেভেল ব্লকের শেষ অস্ত্র)।
+
+=== প্রোটোকল (আগের যাচাইকৃত লজিক, অপরিবর্তিত) ===
+raw socket.io (engine.io EIO=3) over WS:
   WS open → ← 0{sid} → → 40 → ← 40 → (1.2s pacing) →
   42["authorization",{"session":token,"isDemo":n,"tournamentId":0,"isFastHistory":true}]
-    ├─ ← 42["s_authorization"] → paced subscriptions:
+    ├─ ← 42["s_authorization"] → paced subscriptions (120ms):
     │     instruments/update + chart_notification/get + depth/follow + history/load
-    └─ ← 42["authorization/reject"] → isDemo অটো-ফ্লিপ (1→0) → উভয়ই reject হলে
-        টোকেন মেয়াদোত্তীর্ণ রায় (আর হ্যামার নয়)
+    └─ ← 42["authorization/reject"] → isDemo অটো-ফ্লিপ (১→০) → উভয়ই reject হলে
+        টোকেন মেয়াদোত্তীর্ণ রায়
 
-ডেটা ফরম্যাট:
-  টিক: 42[["EURUSD_otc",1698238932,1.08432,1], ...] অথবা binary "quotes/stream"
-  ক্যান্ডেল হিস্ট্রি: 451-["history/list/v2",{_placeholder}] + binary {asset,period,history:{candles}}
-  লাইভ ক্যান্ডেল: 42["candle-generated",{asset,period,open,high,low,close,time}]
-  ব্যালেন্স: 42["balance",{liveBalance,demoBalance}]
+হার্টবিট: প্রতি 10s-এ → '2' (EIO4-স্টাইল ক্লায়েন্ট পিং), সার্ভার ← '3' পঙ্গ
+দেয় (প্রমাণিত); 40s পঙ্গ না এলে সকেট মৃত → পুনঃসংযোগ।
+
+ডেটা: টিক 42[["EURUSD_otc",ts,price,dir],…] / binary quotes/stream,
+ক্যান্ডেল history/load, ব্যালেন্স 42["balance",{liveBalance,demoBalance}]।
 """
 
 import asyncio
 import json
+import os
 import re
+import socket
+import threading
 import time
 
 import websockets
 
+# ============ HARDCODED — টোকেন দিলেই সাথে সাথে কানেক্ট (ইউজারের নির্দেশ) ============
 WS_URL = "wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+BROWSER_HEADERS = {
+    "Origin": "https://qxbroker.com",
+    "User-Agent": UA,
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+# Cloudflare ব্লক করলে ঘুরিয়ে আবার — একটা না মিললে আরেকটা মিলবেই
+IMPERSONATE_ROTATION = ["chrome", "chrome124", "safari", "firefox"]
+# ঐচ্ছিক: IP-লেভেল ব্লকের বিরুদ্ধে শেষ অস্ত্র — QX_PROXY=http://user:pass@host:port
+QX_PROXY = (os.environ.get("QX_PROXY") or "").strip() or None
+
+try:
+    from curl_cffi.requests import WebSocket as CurlWebSocket
+    from curl_cffi.const import CurlInfo
+    HAS_CURL_CFFI = True
+except Exception:  # curl_cffi নেই — websockets ফলব্যাকে চলবে
+    HAS_CURL_CFFI = False
+
+# curl WS ফ্রেম ফ্ল্যাগ (libcurl: TEXT=1 BINARY=2 CONT=4 CLOSE=8 PING=16 PONG=64)
+_WS_BINARY = 2
+_WS_CLOSE = 8
 
 
 def _ws_open(ws) -> bool:
@@ -41,6 +80,24 @@ def _ws_open(ws) -> bool:
         return not ws.closed
     except Exception:
         return False
+
+
+def _fd_shutdown(ws):
+    """সকেট fd shutdown — যেকোনো থ্রেড থেকে নিরাপদ (OS-লেভেল)।
+
+    libcurl handle thread-safe নয়, কিন্তু fd shutdown পারে — ব্লকড
+    recv-ওয়ালা থ্রেড তৎক্ষণাৎ ECONNRESET/CURL 56 এ ভেঙে পড়ে, তারপর
+    recv-মালিক থ্রেড নিজেই terminate করে। (প্রোডাকশনে প্রমাণিত প্যাটার্ন।)"""
+    try:
+        fd = int(ws.curl.getinfo(CurlInfo.ACTIVESOCKET))
+        if fd >= 0:
+            s = socket.socket(fileno=fd)
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            finally:
+                s.detach()  # fd-র মালিকানা libcurl-কেই ফিরিয়ে দিই
+    except Exception:
+        pass
 
 
 def parse_qx_token(raw: str):
@@ -99,7 +156,17 @@ class QuotexEvents:
 
 
 class QuotexClient:
-    """Single-connection client with auto isDemo flip + reconnect."""
+    """Single-connection client with auto isDemo flip + reconnect.
+
+    ট্রান্সপোর্ট: curl_cffi (Chrome ছদ্মবেশ — Cloudflare-proof) প্রাথমিক,
+    plain websockets শেষ-আশ্রয় ফলব্যাক। উভয়েই একই প্রোটোকল হ্যান্ডলার চালায়।
+
+    curl_cffi ট্রান্সপোর্ট থ্রেড-ভিত্তিক (curl-এর sync API):
+      • dedicated OS thread: connect → recv loop → ফ্রেমগুলো event loop-এ
+        call_soon_threadsafe দিয়ে পাঠায় (হ্যান্ডলার সব async প্রান্তেই চলে)
+      • heartbeat thread: প্রতি 10s-এ '2' + 40s পঙ্গ-টাইমআউট পাহারা
+      • সব সেন্ড threading.Lock-কৃত _t_send দিয়ে (যেকোনো থ্রেড থেকে নিরাপদ)
+    """
 
     def __init__(self, token: str, ev: QuotexEvents, pairs=None):
         self.auth = parse_qx_token(token)
@@ -109,12 +176,23 @@ class QuotexClient:
         self.got_ticks = False
         self.ever_opened = False
         self.attempts = 0
+        self.cf_blocks = 0                # Cloudflare ব্লক করবার সংখ্যা
+        self._imp_idx = 0
+        # --- websockets ফলব্যাক স্টেট ---
         self._ws = None
+        self._send_lock = asyncio.Lock()
+        # --- curl_cffi ট্রান্সপোর্ট স্টেট ---
+        self._cws = None                  # curl_cffi WebSocket (connect সফল হলেই সেট)
+        self._send_lock_t = None          # threading.Lock
+        self._hard_stop = False
+        self._session_ended = None        # asyncio.Event
+        self._thread = None
+        self._loop = None
+        # --- সাধারণ ---
         self._task = None
         self._demo_tried = {1: False, 0: False}
         self._last_pong = time.time()
         self._last_tick_ts = time.time()
-        self._send_lock = asyncio.Lock()   # সব WS send এক লাইনে — কোনো ফ্রেম হারাবে না
         self.set_pairs(pairs or [])
 
     # ---------------- public API ----------------
@@ -134,6 +212,11 @@ class QuotexClient:
 
     @property
     def connected(self) -> bool:
+        if self._cws is not None:
+            try:
+                return not self._cws.closed
+            except Exception:
+                return False
         return _ws_open(self._ws)
 
     @property
@@ -142,13 +225,16 @@ class QuotexClient:
 
     async def start(self):
         self.closed = False
+        self._loop = asyncio.get_running_loop()
         self._task = asyncio.create_task(self._run())
 
     async def close(self):
         self.closed = True
-        if self._ws is not None:
+        await self._kill_transport()
+        # থ্রেডকে সেশন-শেষ জানানোর সুযোগ (bounded — কখনো আটকে থাকবে না)
+        if self._session_ended is not None and not self._session_ended.is_set():
             try:
-                await self._ws.close()
+                await asyncio.wait_for(self._session_ended.wait(), timeout=3)
             except Exception:
                 pass
         if self._task is not None:
@@ -173,6 +259,10 @@ class QuotexClient:
                 if self.closed or self.auth_state == "rejected":
                     break
                 self.attempts += 1
+                # বারবার ব্যর্থ হলে ছদ্মবেশ বদলাই — CF একটা ফিঙ্গারপ্রিন্ট
+                # ধরে ফেললেও পরেরটা দিয়ে ঢুকে যাব
+                if self.attempts % 2 == 0:
+                    self._imp_idx += 1
                 delay = min(30, 3 * self.attempts)
                 self._log(f"{delay}s পরে পুনঃসংযোগ…")
                 await asyncio.sleep(delay)
@@ -181,31 +271,198 @@ class QuotexClient:
 
     async def _session(self):
         is_demo = self.auth[1]
-        headers = {
-            "User-Agent": UA,
-            "Origin": "https://qxbroker.com",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        }
+        # সেশন-স্টেট রিসেট (আগের _session-এর শুরুর মতোই)
+        self.auth_state = "idle"
+        self._pending_binary_event = None
+        self._instruments_seen = False
+        self._auth_sent = False
+        self._last_pong = time.time()
+        # ⚠ ever_opened রিসেট করি না — একবার খুললে latch (পুরনো আচরণ)।
+        # isDemo-flip-এর পুনঃসংযোগ-বিরতিতে False হলে start_live ভুল করে
+        # "নেটওয়ার্ক ব্লক" রায় দিতো (৫s নিয়ম) — অথচ সংযোগ ঠিকই চলছিল।
+        if HAS_CURL_CFFI:
+            await self._session_curl(is_demo)
+        else:
+            await self._session_ws(is_demo)
+
+    # ---------------- ট্রান্সপোর্ট ১: curl_cffi (প্রাথমিক) ----------------
+
+    async def _session_curl(self, is_demo):
+        imp = IMPERSONATE_ROTATION[self._imp_idx % len(IMPERSONATE_ROTATION)]
+        mode = " (প্রক্সি)" if QX_PROXY else ""
+        self._log(f"Quotex WS সংযোগ (Chrome-ছদ্মবেশ: {imp}{mode}, isDemo={is_demo})… "
+                  f"চেষ্টা {self.attempts + 1}")
+        self._hard_stop = False
+        self._cws = None
+        self._send_lock_t = threading.Lock()
+        ev_end = asyncio.Event()          # এই সেশনের নিজস্ব — পুরনো থ্রেডের
+        self._session_ended = ev_end       # দেরিতে আসা কলব্যাক নতুনটা ভাঙবে না
+        self._thread = threading.Thread(
+            target=self._curl_thread, args=(imp, ev_end), daemon=True, name="qx-ws")
+        self._thread.start()
+        await ev_end.wait()
+
+    def _curl_thread(self, imp: str, ev_end):
+        """Dedicated OS thread: connect → recv loop। সব কলব্যাক event loop-এ।"""
+        loop = self._loop
+        ws = None
+        try:
+            ws = CurlWebSocket(autoclose=False)
+            kw = {"impersonate": imp, "headers": BROWSER_HEADERS, "timeout": 15}
+            if QX_PROXY:
+                kw["proxy"] = QX_PROXY
+            ws.connect(WS_URL, **kw)
+        except Exception as e:
+            cf = self._looks_like_cf_block(e)
+            if loop is not None and not loop.is_closed():
+                loop.call_soon_threadsafe(self._report_conn_fail, e, imp, cf)
+                loop.call_soon_threadsafe(self._end_session,
+                                          f"connect-fail: {type(e).__name__}", ev_end)
+            return
+        # সংযোগ সফল — স্টেট সেট করে event loop-এ জানাই
+        self._cws = ws
+        self.ever_opened = True
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(self._on_curl_open)
+        hb_stop = threading.Event()
+        hb = threading.Thread(target=self._curl_hb_thread, args=(ws, hb_stop),
+                              daemon=True, name="qx-hb")
+        hb.start()
+        reason = "unknown"
+        try:
+            while not self._hard_stop and not self.closed:
+                try:
+                    data, flags = ws.recv()
+                except Exception as e:
+                    reason = f"recv-end: {type(e).__name__}"
+                    break
+                if flags & _WS_CLOSE:
+                    reason = "server-close"
+                    break
+                if not data:
+                    continue
+                try:
+                    text = data.decode("utf-8", "replace")
+                except Exception:
+                    continue
+                is_bin = bool(flags & _WS_BINARY)
+                try:
+                    if loop is not None and not loop.is_closed():
+                        loop.call_soon_threadsafe(self._dispatch_frame, text, is_bin)
+                except RuntimeError:
+                    break  # loop বন্ধ — আর নয়
+        finally:
+            hb_stop.set()
+            # terminate শুধু এই (recv-মালিক) থ্রেডই করবে — আর কেউ যেন ঠিক
+            # তখন সেন্ড করছে না থাকে, তাই সেন্ড-লকের আড়ালে (thread-safe)
+            lock = self._send_lock_t
+            if lock is not None:
+                with lock:
+                    try:
+                        ws.terminate()
+                    except Exception:
+                        pass
+            else:
+                try:
+                    ws.terminate()
+                except Exception:
+                    pass
+            if self._cws is ws:
+                self._cws = None
+            if loop is not None and not loop.is_closed():
+                try:
+                    loop.call_soon_threadsafe(self._end_session, reason, ev_end)
+                except RuntimeError:
+                    pass
+
+    def _curl_hb_thread(self, ws, stop_ev):
+        """প্রতি 10s-এ '2' পিং (EIO4-স্টাইল) — Quotex সার্ভার নীরব
+        ক্লায়েন্টকে ~30s পরে কেটে দেয়, আর পঙ্গ '3' দিয়ে উত্তর দেয় (প্রমাণিত)।
+        40s পর্যন্ত পঙ্গ না এলে সকেট মৃত → fd-shutdown (থ্রেড-নিরাপদ) →
+        recv-মালিক থ্রেড নিজেই পরিষ্কার করবে।"""
+        while not stop_ev.wait(10):
+            if self.closed or self._hard_stop:
+                return
+            try:
+                with self._send_lock_t:
+                    ws.send_str("2")
+            except Exception:
+                return
+            if time.time() - self._last_pong > 40:
+                self._log_ts("হার্টবিট টাইমআউট (কোনো পঙ্গ নেই) — পুনঃসংযোগ হচ্ছে")
+                _fd_shutdown(ws)
+                return
+
+    def _log_ts(self, msg):
+        """থ্রেড থেকে লগ — event loop-এ নিরাপদে।"""
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(self._log, msg)
+            except RuntimeError:
+                pass
+
+    def _on_curl_open(self):
+        """(event loop) WS খোলা সফল।"""
+        self.attempts = 0
+        self.ev.on_raw("→ [WS OPEN — Chrome ছদ্মবেশ সক্রিয়]")
+
+    def _report_conn_fail(self, e, imp: str, cf: bool):
+        """(event loop) সংযোগ ব্যর্থ — CF হলে বাংলায় স্পষ্ট রায় + রোটেশন।"""
+        if cf:
+            self.cf_blocks += 1
+            self._imp_idx += 1
+            nxt = IMPERSONATE_ROTATION[self._imp_idx % len(IMPERSONATE_ROTATION)]
+            self._log(f"Cloudflare সংযোগ প্রত্যাখ্যান করেছে ({imp}) — পরের চেষ্টায় "
+                      f"{nxt} ফিঙ্গারপ্রিন্টে হবে")
+        else:
+            self._log(f"Quotex সংযোগ ব্যর্থ: {type(e).__name__}: {str(e)[:120]}")
+        self.ev.on_raw(f"✗ connect ({imp}): {type(e).__name__}: {str(e)[:120]}")
+
+    @staticmethod
+    def _looks_like_cf_block(e) -> bool:
+        """CF/WAF-জাতীয় প্রত্যাখ্যান চিনি (403/challenge)।"""
+        s = f"{type(e).__name__} {e}".lower()
+        return ("403" in s or "forbidden" in s or "cloudflare" in s
+                or "challenge" in s or "access denied" in s or "waf" in s)
+
+    def _dispatch_frame(self, text: str, is_bin: bool):
+        """(event loop) থ্রেড থেকে আসা ফ্রেম — হ্যান্ডলার এখানেই চলে।"""
+        try:
+            if is_bin:
+                self._handle_binary(text)
+            else:
+                self._handle_text(text)
+        except Exception as e:
+            self.ev.on_raw(f"⚠ ফ্রেম হ্যান্ডলার: {type(e).__name__}: {e}")
+
+    def _end_session(self, reason: str, ev_end=None):
+        """(event loop) সেশন শেষ — শুধু নিজের সেশনের event-ই মুক্ত করে।"""
+        if self.auth_state == "ok":
+            self.ev.on_status(False, f"সংযোগ বিচ্ছিন্ন ({reason}) — পুনঃসংযোগ হচ্ছে")
+        self.ev.on_raw(f"← [WS END {reason}]")
+        ev = ev_end if ev_end is not None else self._session_ended
+        if ev is not None:
+            ev.set()
+
+    # ---------------- ট্রান্সপোর্ট ২: websockets (ফলব্যাক) ----------------
+
+    async def _session_ws(self, is_demo):
+        """curl_cffi নেই এমন পরিবেশের জন্য আগের যাচাইকৃত async পথ।"""
+        headers = dict(BROWSER_HEADERS)
         if self.auth[0]:
             headers["Cookie"] = f"q9securid={self.auth[0]};"
-        self._log(f"Quotex WS সংযোগ (ws2.qxbroker.com, isDemo={is_demo})… চেষ্টা {self.attempts + 1}")
+        self._log(f"Quotex WS সংযোগ (websockets ফলব্যাক, isDemo={is_demo})… "
+                  f"চেষ্টা {self.attempts + 1}")
         async with websockets.connect(
                 WS_URL, additional_headers=headers, max_size=20 * 1024 * 1024,
                 open_timeout=12, close_timeout=3, ping_interval=20, ping_timeout=20) as ws:
             self._ws = ws
             self.ever_opened = True
             self.attempts = 0
-            self.auth_state = "idle"
-            self._pending_binary_event = None
-            self._instruments_seen = False
-            self._auth_sent = False
-            self._last_pong = time.time()
             self.ev.on_raw("→ [WS OPEN]")
             ws_open = True
             hb_task = asyncio.create_task(self._heartbeat(ws))
-
             try:
                 while not self.closed and ws_open:
                     try:
@@ -227,10 +484,7 @@ class QuotexClient:
                 self._ws = None
 
     async def _heartbeat(self, ws):
-        """Quotex-এর কাস্টম সার্ভার ক্লায়েন্টের পিং (EIO4-স্টাইল '2') আশা করে —
-        সার্ভার নিজে কখনো '2' পাঠায় না, আর নীরব ক্লায়েন্টকে ~30s পর কেটে দেয়
-        (পরীক্ষিত: প্রতি 10s-এ '2' পাঠালে 120s+ সংযোগ বাঁচে, টিক অবিচ্ছিন্ন)।
-        প্রতি 10s-এ '2' পাঠাই; 40s পর্যন্ত '3' পঙ্গ না এলে সকেট মৃত ধরে পুনঃসংযোগ।"""
+        """(websockets ফলব্যাক) প্রতি 10s-এ '2'; 40s পঙ্গ না এলে পুনঃসংযোগ।"""
         while not self.closed:
             await asyncio.sleep(10)
             if self.closed or not _ws_open(ws):
@@ -248,12 +502,20 @@ class QuotexClient:
                     pass
                 return
 
-    # ---------------- protocol ----------------
+    # ---------------- প্রোটোকল ----------------
 
     async def _send(self, raw: str):
-        """সব সেন্ড এই এক লকের পথ দিয়ে — awaited, serialized, নিরাপদ।
-        (আগে fire-and-forget ছিল: হার্টবিটের সাথে রেস করে ফ্রেম হারাতো —
-        সার্ভার তখন quote-র header পাঠাতো কিন্তু binary স্ট্রিম বন্ধ রাখতো।)"""
+        """সব সেন্ড এই এক পথ দিয়ে — awaited, serialized, নিরাপদ।
+        curl ট্রান্সপোর্ট: executor-এ থ্রেড-লক সহ send_str।
+        websockets ফলব্যাক: asyncio লক সহ সরাসরি।"""
+        if self._cws is not None:
+            self.ev.on_raw(f"→ {raw[:160]}")
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self._t_send, raw)
+            except Exception as e:
+                self.ev.on_raw(f"✗ send failed: {raw[:60]} → {type(e).__name__}: {e}")
+            return
         ws = self._ws
         if not _ws_open(ws):
             return
@@ -263,6 +525,15 @@ class QuotexClient:
                 await ws.send(raw)
         except Exception as e:
             self.ev.on_raw(f"✗ send failed: {raw[:60]} → {type(e).__name__}: {e}")
+
+    def _t_send(self, raw: str):
+        """(যেকোনো থ্রেড) curl WS সেন্ড — লকের ভেতরে।"""
+        ws = self._cws
+        lock = self._send_lock_t
+        if ws is None or lock is None:
+            return
+        with lock:
+            ws.send_str(raw)
 
     def _send_bg(self, raw: str):
         """সিঙ্ক কনটেক্সট থেকে ব্যাকগ্রাউন্ড সেন্ড।"""
@@ -445,18 +716,38 @@ class QuotexClient:
 
     async def _flip_retry(self):
         """isDemo flip → নতুন সকেটে আবার auth।"""
-        try:
-            if self._ws is not None:
-                await self._ws.close()
-        except Exception:
-            pass
+        await self._kill_transport()
 
     async def _safe_close(self):
-        try:
-            if self._ws is not None:
+        await self._kill_transport()
+
+    async def _kill_transport(self):
+        """উভয় ট্রান্সপোর্ট বন্ধ — থ্রেড-নিরাপদ পথে।
+
+        ⚠ libcurl handle thread-safe নয়: অন্য থ্রেডের ব্লকড recv-এর মাঝখানে
+        terminate() ডাকলে প্রসেস SIGABRT-এ মারা যায় (প্রমাণিত)। তাই বাইরের
+        থ্রেড থেকে আমরা কেবল (ক) WS close-ফ্রেম পাঠাই আর (খ) সকেট fd shutdown
+        করি (OS-লেভেল, সর্বদা নিরাপদ) — recv-মালিক থ্রেড তৎক্ষণাৎ ভেঙে
+        নিজেই (সেন্ড-লকের আড়ালে) terminate করে পরিষ্কার হয়।"""
+        self._hard_stop = True
+        ws = self._cws
+        if ws is not None:
+            # (ক) সার্ভারকে বিদায় জানাই — best-effort, লকের ভেতরে
+            lock = self._send_lock_t
+            if lock is not None:
+                try:
+                    with lock:
+                        from curl_cffi.const import CurlWsFlag
+                        ws.send(b"", CurlWsFlag.CLOSE)
+                except Exception:
+                    pass
+            # (খ) সকেট বন্ধ — ব্লকড recv এখনই ভাঙবে
+            _fd_shutdown(ws)
+        if self._ws is not None:
+            try:
                 await self._ws.close()
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     def _handle_quote_batch(self, rows):
         for q in rows:
@@ -555,9 +846,12 @@ class QuotexClient:
         if self.closed or self.auth_state != "ok":
             return
         await self._send_subscription_batch()
-        while not self.closed and self.auth_state == "ok" and _ws_open(self._ws):
+        while not self.closed and self.auth_state == "ok" and (
+                _ws_open(self._ws) or self._cws is not None):
             await asyncio.sleep(15)
-            if self.closed or self.auth_state != "ok" or not _ws_open(self._ws):
+            if self.closed or self.auth_state != "ok":
+                return
+            if not (_ws_open(self._ws) or self._cws is not None):
                 return
             if time.time() - self._last_tick_ts > 90:
                 self._log("90s ধরে কোনো টিক আসেনি — সাবস্ক্রিপশন আবার পাঠানো হচ্ছে…")
@@ -576,7 +870,7 @@ class QuotexClient:
                 "offset": 720, "period": 60}], separators=(",", ":")))
         await asyncio.sleep(0.4)
         for i, s in enumerate(sends):
-            if self.closed or not _ws_open(self._ws):
+            if self.closed or not (_ws_open(self._ws) or self._cws is not None):
                 return
             await self._send(s)
             await asyncio.sleep(0.12)

@@ -18,9 +18,17 @@ if [ -z "$PY" ]; then
 fi
 
 # deps (quiet, best-effort — sandbox/Docker images may pre-install them)
+# curl_cffi = Cloudflare bypass (Chrome TLS ছদ্মবেশ) — না থাকলে websockets
+# ফলব্যাকে চলবে, তাই এটা আলাদা করে ইনস্টল করি যেন কখনো আটকে না বসে
 if ! "$PY" -c "import websockets, socketio, aiohttp" >/dev/null 2>&1; then
   "$PY" -m pip install --quiet websockets "python-socketio[aiohttp]" >/dev/null 2>&1 || \
   "$PY" -m pip install --quiet --break-system-packages websockets "python-socketio[aiohttp]" >/dev/null 2>&1 || true
+fi
+if ! "$PY" -c "import curl_cffi" >/dev/null 2>&1; then
+  echo "[run.sh] curl_cffi ইনস্টল হচ্ছে (Cloudflare bypass)…"
+  "$PY" -m pip install --quiet curl_cffi >/dev/null 2>&1 || \
+  "$PY" -m pip install --quiet --break-system-packages curl_cffi >/dev/null 2>&1 || \
+  echo "[run.sh] ⚠ curl_cffi ইনস্টল হয়নি — websockets ফলব্যাকে চলবে"
 fi
 
 while true; do
